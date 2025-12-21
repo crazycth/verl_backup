@@ -21,6 +21,7 @@ This trainer supports model-agonistic model initialization with huggingface
 import json
 import os
 import uuid
+import copy
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -977,40 +978,228 @@ class RayPPOTrainer:
         return batch, {}
     
 
-    def post_process(self, batch, method):
-        # 1. 获取 Numpy 格式的 scores
+    def post_process(self, batch, method, entropy):
+        import numpy as np
+        from collections import defaultdict
+
+        # 1. 预先获取引用
         scores = batch.non_tensor_batch['score']
-        
-        # 2. 获取 PyTorch 格式的 mask 引用
         response_mask = batch.batch['response_mask']
-        
-        # 3. 确定要清零的行 (得到一个 Numpy 布尔数组)
+        metrics = {}
+
         if method == "posonly":
-            # posonly: 既然只想要 positive，那么就把 score == 0 (负例) 的 mask 清零
+            # --- posonly 逻辑 ---
             rows_to_zero_numpy = (scores == 0)
-            
+            rows_to_zero_tensor = torch.tensor(
+                rows_to_zero_numpy, 
+                dtype=torch.bool, 
+                device=response_mask.device
+            )
+            print(f"[INFO] posonly: set {rows_to_zero_tensor.sum()} rows to zero", flush=True)
+            batch.batch['response_mask'][rows_to_zero_tensor, :] = 0
+
         elif method == "negonly":
-            # negonly: 既然只想要 negative，那么就把 score == 1 (正例) 的 mask 清零
-            # (假设正例 score 也是离散的 1.0，如果不是严格的 1，可以用 scores > 0)
+            # --- negonly 逻辑 ---
             rows_to_zero_numpy = (scores == 1)
+            rows_to_zero_tensor = torch.tensor(
+                rows_to_zero_numpy, 
+                dtype=torch.bool, 
+                device=response_mask.device
+            )
+            print(f"[INFO] negonly: set {rows_to_zero_tensor.sum()} rows to zero", flush=True)
+            batch.batch['response_mask'][rows_to_zero_tensor, :] = 0
+
+        elif method == "entropy-clip":
+
+            clip_mode = self.config.trainer.entropy_clip_mode
+            clip_ratio = self.config.trainer.entropy_clip_ratio
             
+            # --- [Part 1] 全局筛选逻辑 (保持不变) ---
+            valid_mask = response_mask.bool() 
+            total_valid_tokens = valid_mask.sum().item()
+
+            k = 0
+            if clip_mode == "ratio":
+                k = int(total_valid_tokens * float(clip_ratio))
+            elif clip_mode == "num":
+                k = int(clip_ratio)
+                k = min(k, total_valid_tokens)
+            
+            assert k > 0
+
+            masked_entropy = entropy.clone()
+            masked_entropy[~valid_mask] = -float('inf')
+
+            flat_entropy = masked_entropy.view(-1)
+            _, topk_indices = torch.topk(flat_entropy, k)
+
+            new_flat_mask = torch.zeros_like(flat_entropy, dtype=batch.batch['response_mask'].dtype)
+            new_flat_mask[topk_indices] = 1
+            batch.batch['response_mask'] = new_flat_mask.view_as(response_mask)
+
+            # --- [Part 2] 监控逻辑：重点关注 Query 间的资源分配 ---
+            
+            # 1. 计算每一行(response)保留了多少 token
+            # row_token_counts shape: [B], content: [120, 0, 50, ...]
+            row_token_counts = batch.batch['response_mask'].sum(dim=1).float().cpu().numpy()
+            uids = batch.non_tensor_batch['uid']
+            
+            # 2. 按 UID 聚合
+            uid_stats = defaultdict(list)
+            for uid, count in zip(uids, row_token_counts):
+                uid_stats[uid].append(count)
+            
+            # 3. 提取列表用于计算统计量
+            query_total_tokens = []
+            query_avg_tokens = []
+            
+            log_msg = [f"[INFO] entropy-clip ({clip_mode}={clip_ratio}) Fairness Monitor:"]
+
+            for uid, counts in uid_stats.items():
+                total_for_this_query = np.sum(counts)
+                avg_for_this_query = np.mean(counts)
+                
+                query_total_tokens.append(total_for_this_query)
+                query_avg_tokens.append(avg_for_this_query)
+                
+                log_msg.append(
+                    f"  UID[{str(uid)[:8]}..]: Total={int(total_for_this_query)} tokens | "
+                    f"AvgPerResp={avg_for_this_query:.1f}"
+                )
+
+            # 4. 计算 Query 间的不均匀性指标
+            q_totals = np.array(query_total_tokens)
+            inter_q_max = np.max(q_totals)
+            inter_q_min = np.min(q_totals)
+            inter_q_mean = np.mean(q_totals)
+            inter_q_std = np.std(q_totals)
+
+            # --- [Part 3] 新增功能：正负例有效 Token 统计 ---
+
+            # import pdb; pdb.set_trace()
+            
+            # scores 类似 array([0., 1., 0., ...])
+            # 确保 row_token_counts 和 scores 长度一致 (通常 batch size 一致)
+            
+            # 找到正例(1)和负例(0)的索引掩码
+            is_pos = (scores == 1)
+            is_neg = (scores == 0)
+            
+            # 利用布尔索引，从 row_token_counts 中取出对应的行，并求和
+            pos_valid_sum = np.sum(row_token_counts[is_pos])
+            neg_valid_sum = np.sum(row_token_counts[is_neg])
+            
+            # 将正负例分布添加到 log 方便一眼看到
+            log_msg.append(f"  >> Split: PosTokens={int(pos_valid_sum)}, NegTokens={int(neg_valid_sum)}")
+            log_msg.append(f"  >> Summary: Min={inter_q_min}, Max={inter_q_max}, Mean={inter_q_mean:.1f}, Std={inter_q_std:.1f}")
+            print("\n".join(log_msg), flush=True)
+
+            # import pdb; pdb.set_trace()
+
+            # 5. 写入 Metrics
+            metrics["post_process/entropy/total_kept"] = k
+            
+            # [Query 间的贫富差距]
+            metrics["post_process/entropy/dist_inter_query_min"] = inter_q_min
+            metrics["post_process/entropy/dist_inter_query_max"] = inter_q_max
+            metrics["post_process/entropy/dist_inter_query_std"] = inter_q_std
+            metrics["post_process/entropy/dist_fairness_ratio"] = (inter_q_min + 1e-6) / (inter_q_max + 1e-6)
+            
+            # [新增：正负例分布]
+            metrics["post_process/entropy/valid_token/pos"] = pos_valid_sum
+            metrics["post_process/entropy/valid_token/neg"] = neg_valid_sum
+
+        elif method == "entropy-clip-query":
+            clip_mode = self.config.trainer.entropy_clip_mode
+            clip_ratio = self.config.trainer.entropy_clip_ratio
+
+            new_response_mask = torch.zeros_like(response_mask)
+            uids = batch.non_tensor_batch['uid'] # 获取 UID 用于分组
+            uid_to_indices = defaultdict(list)
+            for idx, uid in enumerate(uids):
+                uid_to_indices[uid].append(idx)
+            total_kept_global = 0
+
+            for uid, indices in uid_to_indices.items():
+                indices_tensor = torch.tensor(indices, device=response_mask.device)
+                group_entropy = entropy[indices_tensor]
+                group_valid_mask = response_mask[indices_tensor].bool()
+
+                total_valid_tokens_group = group_valid_mask.sum().item()
+                k = int(total_valid_tokens_group * float(clip_ratio))
+                assert k > 0 
+
+                group_entropy_masked = group_entropy.clone()
+                group_entropy_masked[~group_valid_mask] = -float('inf')
+
+                # 展平做 Top-K
+                flat_group_entropy = group_entropy_masked.view(-1)
+                _, topk_indices = torch.topk(flat_group_entropy, k)
+
+                local_flat_mask = torch.zeros_like(flat_group_entropy, dtype=response_mask.dtype)
+                local_flat_mask[topk_indices] = 1
+
+                local_mask = local_flat_mask.view(group_entropy.shape)
+                new_response_mask[indices_tensor] = local_mask
+
+                total_kept_global += k
+            
+
+            batch.batch['response_mask'] = new_response_mask
+            
+            # 1. 计算每一行(response)保留了多少 token
+            row_token_counts = batch.batch['response_mask'].sum(dim=1).float().cpu().numpy()
+            
+            # 2. 按 UID 聚合统计
+            uid_stats = defaultdict(list)
+            for uid, count in zip(uids, row_token_counts):
+                uid_stats[uid].append(count)
+            
+            query_total_tokens = []
+            
+            log_msg = [f"[INFO] entropy-clip (Per-Query {clip_mode}={clip_ratio}) Monitor:"]
+
+            for uid, counts in uid_stats.items():
+                total_for_this_query = np.sum(counts)
+                query_total_tokens.append(total_for_this_query)
+                # 这里的 log 会变长，如果 batch 很大可以注释掉下面这行 detail
+                # log_msg.append(f"  UID[{str(uid)[:6]}]: {int(total_for_this_query)} tokens")
+
+            # 4. 计算 Query 间的不均匀性指标
+            q_totals = np.array(query_total_tokens)
+            inter_q_max = np.max(q_totals) if len(q_totals) > 0 else 0
+            inter_q_min = np.min(q_totals) if len(q_totals) > 0 else 0
+            inter_q_mean = np.mean(q_totals) if len(q_totals) > 0 else 0
+            inter_q_std = np.std(q_totals) if len(q_totals) > 0 else 0
+
+            # 正负例统计
+            is_pos = (scores == 1)
+            is_neg = (scores == 0)
+            pos_valid_sum = np.sum(row_token_counts[is_pos])
+            neg_valid_sum = np.sum(row_token_counts[is_neg])
+            
+            log_msg.append(f"  >> Split: PosTokens={int(pos_valid_sum)}, NegTokens={int(neg_valid_sum)}")
+            log_msg.append(f"  >> Fairness: Min={inter_q_min}, Max={inter_q_max}, Mean={inter_q_mean:.1f}")
+            print("\n".join(log_msg), flush=True)
+
+            # 5. 写入 Metrics
+            metrics["post_process/entropy/total_kept"] = total_kept_global
+            metrics["post_process/entropy/dist_inter_query_min"] = inter_q_min
+            metrics["post_process/entropy/dist_inter_query_max"] = inter_q_max
+            metrics["post_process/entropy/dist_inter_query_std"] = inter_q_std
+            # 这个 ratio 越接近 1，说明你的 +AB 策略越成功（每个 query 分配到的计算量越均匀）
+            metrics["post_process/entropy/dist_fairness_ratio"] = (inter_q_min + 1e-6) / (inter_q_max + 1e-6)
+            
+            metrics["post_process/entropy/valid_token/pos"] = pos_valid_sum
+            metrics["post_process/entropy/valid_token/neg"] = neg_valid_sum
+
+            # import pdb; pdb.set_trace()
+
         else:
             raise ValueError(f"[INFO] unknown method: {method}")
 
-        # 4. 将 Numpy 布尔数组转换为 Tensor 布尔索引
-        # 关键点：必须转为 tensor，且 device 必须和 response_mask 一致
-        rows_to_zero_tensor = torch.tensor(
-            rows_to_zero_numpy, 
-            dtype=torch.bool, 
-            device=response_mask.device
-        )
-        print(f"[INFO] set response-mask to none: {rows_to_zero_tensor}", flush=True)
+        return batch, metrics
 
-        # 5. 执行修改
-        # 利用布尔索引选择行，将这些行的所有列设置为 0
-        # 语法含义：batch.batch['response_mask'][需要清零的行, 所有列] = 0
-        batch.batch['response_mask'][rows_to_zero_tensor, :] = 0
-        return batch
 
     def fit(self):
         """
@@ -1153,6 +1342,8 @@ class RayPPOTrainer:
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                         entropys = old_log_prob.batch["entropys"]
+                        global_old_entropys = deepcopy(entropys)
+
                         response_masks = batch.batch["response_mask"]
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
                         entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
@@ -1227,7 +1418,10 @@ class RayPPOTrainer:
                     post_process = self.config.trainer.get("post_process", None)
                     if post_process and len(post_process) > 0:
                         print(f"[INFO] use post_process here, method: {post_process}", flush=True)
-                        batch = self.post_process(batch, post_process)
+                        batch, post_metrics = self.post_process(batch, post_process, entropy=global_old_entropys)
+                        metrics.update(post_metrics)
+                    
+                    # import pdb; pdb.set_trace()
 
 
                     # update critic
@@ -1251,6 +1445,90 @@ class RayPPOTrainer:
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+                    
+
+                    # recompute logprob after update policy
+                    recompute_logprob_after = self.config.trainer.get("recompute_logprob_after", False)
+
+                    def to_cpu(t):
+                        if isinstance(t, torch.Tensor):
+                            return t.detach().cpu()
+                        return t
+
+                    if recompute_logprob_after:
+                        print(f"[INFO] recompute logprob after policy update", flush=True)
+                        with marked_timer("recompute_logprob_after", timing_raw, color="blue"):
+                            logprob_batch_key = ["input_ids", "attention_mask", "position_ids", "responses"]
+                            logprob_batch = batch.select(batch_keys=logprob_batch_key)
+
+                            # for current batch
+                            old_logprobs = batch.batch.get("old_log_probs")
+                            old_entropys = global_old_entropys
+                            response_masks = batch.batch["response_mask"]
+
+                            # recompute logprobs after update
+                            logprob_after = self.actor_rollout_wg.compute_log_prob(logprob_batch)
+                            current_logprob = logprob_after.batch["old_log_probs"]
+                            current_entropys = logprob_after.batch["entropys"]
+
+                            # import pdb; pdb.set_trace()
+
+                            # wandb log
+                            logprob_diff = current_logprob - old_logprobs
+                            logprob_diff_masked_mean = masked_mean(logprob_diff, response_masks)
+
+                            pos_rollout_idx = batch.non_tensor_batch['score'] > 0
+                            neg_rollout_idx = batch.non_tensor_batch['score'] <= 0
+
+                            logprob_diff_pos = masked_mean(logprob_diff[pos_rollout_idx], response_masks[pos_rollout_idx])
+                            logprob_diff_neg = masked_mean(logprob_diff[neg_rollout_idx], response_masks[neg_rollout_idx])
+
+                            entropy_diff = current_entropys - old_entropys
+                            entropy_diff_masked_mean = masked_mean(entropy_diff, response_masks)
+                            pos_entropy_diff = masked_mean(entropy_diff[pos_rollout_idx], response_masks[pos_rollout_idx])
+                            neg_entropy_diff = masked_mean(entropy_diff[neg_rollout_idx], response_masks[neg_rollout_idx])
+
+                            metric_dict = {
+                                "dynamic/logprob_diff/mean": logprob_diff_masked_mean,
+                                "dynamic/logprob_diff/mean/pos": logprob_diff_pos,
+                                "dynamic/logprob_diff/mean/neg": logprob_diff_neg,
+
+                                "dynamic/entropy_diff/mean": entropy_diff_masked_mean,
+                                "dynamic/entropy_diff/mean/pos": pos_entropy_diff,
+                                "dynamic/entropy_diff/mean/neg": neg_entropy_diff
+                            }
+                            metrics.update(metric_dict)
+
+
+                            # dump to local
+                            # import pdb; pdb.set_trace()
+                            dump_dir = self.config.trainer.get("dump_dir")
+                            if not os.path.exists(dump_dir):
+                                os.makedirs(dump_dir)
+                            dump_path = os.path.join(dump_dir, f"step_{self.global_steps}.pt")
+                            dump_data = {
+                                    # --- From batch.batch (Tensors) ---
+                                    'input_ids': to_cpu(batch.batch.get('input_ids')),
+                                    'old_log_probs': to_cpu(batch.batch.get('old_log_probs')),
+                                    'response_masks': to_cpu(batch.batch.get('response_mask')), # 注意代码里原本使用的是 response_mask
+                                    'responses': to_cpu(batch.batch.get('responses')),
+                                    
+                                    # --- From batch.non_tensor_batch (List/Meta) ---
+                                    'uuid': batch.non_tensor_batch.get('uuid'),
+                                    'score': batch.non_tensor_batch.get('score'),
+                                    
+                                    # --- Computed Values ---
+                                    # 这里保存 current_logprob，即 update 后的 logprob
+                                    'logprob_after': to_cpu(current_logprob), 
+                                    'old_entropys': to_cpu(old_entropys),
+                                    'current_entropys': to_cpu(current_entropys)
+                                }
+                            print(f"[INFO] Dumping debug data to {dump_path}", flush=True)
+                            torch.save(dump_data, dump_path)
+                            # import pdb; pdb.set_trace()
+
+
+
 
                 # validate
                 if (

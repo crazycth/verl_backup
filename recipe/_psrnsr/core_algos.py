@@ -301,6 +301,7 @@ def compute_grpo_outcome_advantage(
         Returns: `(torch.Tensor)`
             shape is (bs, response_length)
     """
+    print(f"[INFO] use reward mode: grpo", flush=True)
     scores = token_level_rewards.sum(dim=-1)
 
     id2score = defaultdict(list)
@@ -332,7 +333,7 @@ def compute_grpo_outcome_advantage(
 
 
 @register_adv_est(AdvantageEstimator.PG)
-def compute_grpo_outcome_advantage(
+def compute_policygradient_outcome_advantage(
     token_level_rewards: torch.Tensor,
     response_mask: torch.Tensor,
     index: np.ndarray,
@@ -356,7 +357,7 @@ def compute_grpo_outcome_advantage(
 
 
 @register_adv_est(AdvantageEstimator.PSR)
-def compute_grpo_outcome_advantage(
+def compute_psrnsr_psr_outcome_advantage(
     token_level_rewards: torch.Tensor,
     response_mask: torch.Tensor,
     index: np.ndarray,
@@ -382,7 +383,7 @@ def compute_grpo_outcome_advantage(
 
 
 @register_adv_est(AdvantageEstimator.NSR)
-def compute_grpo_outcome_advantage(
+def compute_psrnsr_nsr_outcome_advantage(
     token_level_rewards: torch.Tensor,
     response_mask: torch.Tensor,
     index: np.ndarray,
