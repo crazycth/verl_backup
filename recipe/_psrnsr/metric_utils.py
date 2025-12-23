@@ -171,6 +171,44 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     pos_logprobs_mean = old_log_probs[pos_rollout_idx].mean().detach().item()
     neg_logprobs_mean = old_log_probs[neg_rollout_idx].mean().detach().item()
 
+    # grpo 无效group 细节
+    from collections import defaultdict
+    group_stats = defaultdict(list)
+
+    for r,u in zip(batch.non_tensor_batch['score'], batch.non_tensor_batch['uid']):
+        group_stats[u].append(r)
+    
+    total_queries = len(group_stats)
+    all_ones_count = 0   # 全是 1
+    all_zeros_count = 0  # 全是 0
+    mixed_count = 0      # 有 0 也有 1 (有学习动力)
+    
+    for u, rs in group_stats.items():
+        has_pos = any(x > 0.5 for x in rs) 
+        has_neg = any(x < 0.5 for x in rs)
+
+        if has_pos and not has_neg:
+            all_ones_count += 1
+        elif not has_pos and has_neg:
+            all_zeros_count += 1
+        elif has_pos and has_neg:
+            mixed_count += 1
+    
+    ratio_all_ones = all_ones_count / total_queries if total_queries > 0 else 0.0
+    ratio_all_zeros = all_zeros_count / total_queries if total_queries > 0 else 0.0
+    ratio_active_learning = mixed_count / total_queries if total_queries > 0 else 0.0
+
+    # pos/neg 真正训练的Token总数
+    scores_np = np.array(batch.non_tensor_batch['score'])
+
+    masks_tensor = batch.batch['response_mask']
+    pos_indices = np.where(scores_np > 0.5)[0]
+    neg_indices = np.where(scores_np < 0.5)[0]
+
+    pos_token_cnt = masks_tensor[pos_indices].sum().item() if len(pos_indices) > 0 else 0
+    neg_token_cnt = masks_tensor[neg_indices].sum().item() if len(neg_indices) > 0 else 0
+    pos_neg_ratio = pos_token_cnt / (neg_token_cnt + 1e-5)
+
 
     metrics = {
         # score
@@ -219,6 +257,16 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         # pos/neg logprobs
         "logprobs/mean/pos": pos_logprobs_mean,
         "logprobs/mean/neg": neg_logprobs_mean,
+
+        # grpo details
+        "grpo/query_ratio_all_ones": ratio_all_ones,
+        "grpo/query_ratio_all_zeros": ratio_all_zeros,
+        "grpo/query_ratio_active_learning": ratio_active_learning,
+
+        # pos/neg train tokens
+        "grpo/pos_token_cnt": pos_token_cnt,
+        "grpo/neg_token_cnt": neg_token_cnt,
+        "grpo/pos_neg_ratio": pos_neg_ratio,
 
         # response length (non-aborted only)
         # These statistics exclude aborted samples to avoid skew from zeros
