@@ -126,6 +126,11 @@ class ActorConfig(BaseConfig):
     gradient_path: Optional[str] = None
     gradient_per_step: Optional[int] = 5
     layer_name: Optional[str] = None
+
+    # entropy_clip
+    use_token_filter: bool = False
+    token_filter_method: Optional[str] = None
+    entropy_top_ratio: Optional[float] = None
     
 
     def __post_init__(self):

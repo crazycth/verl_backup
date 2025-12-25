@@ -982,12 +982,50 @@ class RayPPOTrainer:
         import numpy as np
         from collections import defaultdict
 
+        # import pdb; pdb.set_trace()
+
         # 1. 预先获取引用
         scores = batch.non_tensor_batch['score']
         response_mask = batch.batch['response_mask']
         metrics = {}
 
-        if method == "posonly":
+        if method == "filter-long":
+            # --- filter-long 逻辑 ---
+            # 1. 计算每个 rollout 的有效长度
+            seq_lengths = response_mask.sum(dim=-1)
+            
+            # 2. 找到长度大于 8190 的行 (Boolean Tensor)
+            threshold = 8190
+            rows_to_zero_tensor = seq_lengths > threshold
+            
+            # --- 新增：计算 Pos/Neg 的被过滤统计 ---
+            # A. 准备数据：将 tensor mask 转为 numpy，确保 scores 也是 numpy
+            is_long_numpy = rows_to_zero_tensor.cpu().numpy()
+            scores_numpy = np.array(scores) # 防止 scores 是 list
+
+            # B. 计算交集：(是长序列) AND (是正/负样本)
+            # 假设：score > 0 为正样本 (Pos), score == 0 为负样本 (Neg)
+            pos_filtered_count = (is_long_numpy & (scores_numpy > 0)).sum()
+            neg_filtered_count = (is_long_numpy & (scores_numpy == 0)).sum()
+
+            # C. 赋值给 metrics 变量
+            pos_valid_sum = pos_filtered_count
+            neg_valid_sum = neg_filtered_count
+            
+            # 3. 打印日志
+            print(f"[INFO] filter-long: set {rows_to_zero_tensor.sum()} rows to zero (length > {threshold})", flush=True)
+            print(f"       Details: {pos_valid_sum} pos samples, {neg_valid_sum} neg samples filtered.", flush=True)
+
+            # 4. 执行 Mask 操作
+            batch.batch['response_mask'][rows_to_zero_tensor, :] = 0
+
+            # 5. 记录 Metrics
+            metrics["post_process/filterlong/pos"] = pos_valid_sum
+            metrics["post_process/filterlong/neg"] = neg_valid_sum
+
+
+
+        elif method == "posonly":
             # --- posonly 逻辑 ---
             rows_to_zero_numpy = (scores == 0)
             rows_to_zero_tensor = torch.tensor(

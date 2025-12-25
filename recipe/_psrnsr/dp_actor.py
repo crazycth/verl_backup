@@ -31,7 +31,7 @@ import torch.distributed as dist
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
 # from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
-from recipe._psrnsr.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
+from recipe._psrnsr.core_algos import agg_loss, get_policy_loss_fn, kl_penalty, get_global_entropy_top_mask
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -563,9 +563,11 @@ class DataParallelPPOActor(BasePPOActor):
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
             select_keys.append("rollout_is_weights")
+        
+        # import pdb; pdb.set_trace()
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
-        non_tensor_select_keys = ["multi_modal_inputs", "score"] if has_multi_modal_inputs else ["score"]
+        non_tensor_select_keys = ["multi_modal_inputs", "score"] if has_multi_modal_inputs else ["score", "uid"]
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
@@ -635,7 +637,12 @@ class DataParallelPPOActor(BasePPOActor):
 
                     # all return: (bsz, response_length)
                     calculate_entropy = False
-                    if entropy_coeff != 0:
+                    use_token_filter = self.config.get("use_token_filter", False)
+                    token_filter_method = self.config.get("token_filter_method", None)
+                    entropy_top_ratio = self.config.get('entropy_top_ratio', None)
+                    
+
+                    if entropy_coeff != 0 or use_token_filter:
                         calculate_entropy = True
                     entropy, log_prob = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
@@ -645,6 +652,14 @@ class DataParallelPPOActor(BasePPOActor):
                         old_log_prob = log_prob.detach()
                     else:
                         old_log_prob = model_inputs["old_log_probs"]
+                    
+                    entropy_top_mask = None
+                    if use_token_filter and token_filter_method == "batch":
+                        print(f"[INFO] use token filter, filter method: batch, ratio: {entropy_top_ratio}", flush=True)
+                        entropy_top_mask = get_global_entropy_top_mask(entropy=entropy, response_mask=response_mask, top_ratio=entropy_top_ratio)
+
+                        
+
 
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
@@ -662,16 +677,28 @@ class DataParallelPPOActor(BasePPOActor):
                     # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
 
-                    # Compute policy loss (all functions return 4 values)
-                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
-                        old_log_prob=old_log_prob,
-                        log_prob=log_prob,
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        loss_agg_mode=loss_agg_mode,
-                        config=self.config,
-                        rollout_is_weights=rollout_is_weights,
-                    )
+                    if entropy_top_mask is not None:
+                        # Compute policy loss (all functions return 4 values)
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                            entropy_top_mask=entropy_top_mask,
+                        )
+                    else:
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                        )
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
