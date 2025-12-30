@@ -995,7 +995,7 @@ class RayPPOTrainer:
             seq_lengths = response_mask.sum(dim=-1)
             
             # 2. 找到长度大于 8190 的行 (Boolean Tensor)
-            threshold = 8190
+            threshold = 4090
             rows_to_zero_tensor = seq_lengths > threshold
             
             # --- 新增：计算 Pos/Neg 的被过滤统计 ---
@@ -1230,8 +1230,6 @@ class RayPPOTrainer:
             
             metrics["post_process/entropy/valid_token/pos"] = pos_valid_sum
             metrics["post_process/entropy/valid_token/neg"] = neg_valid_sum
-
-            # import pdb; pdb.set_trace()
 
         else:
             raise ValueError(f"[INFO] unknown method: {method}")
