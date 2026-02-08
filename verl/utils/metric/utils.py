@@ -19,6 +19,8 @@ from typing import Any
 
 import numpy as np
 
+from copy import deepcopy
+
 
 def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
     """
@@ -52,3 +54,15 @@ def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
         else:
             metrics[key] = np.mean(val)
     return metrics
+
+
+def reduce_metrics_with_key(metrics, start_key):
+    new_metrics = deepcopy(metrics)
+    for key, val in metrics.items():
+        if "max" in key:
+            new_metrics[f"{start_key}/{key}"] = np.max(val)
+        elif "min" in key:
+            new_metrics[f"{start_key}/{key}"] = np.min(val)
+        else:
+            new_metrics[f"{start_key}/{key}"] = np.mean(val)
+    return new_metrics

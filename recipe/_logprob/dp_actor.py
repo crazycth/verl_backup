@@ -182,7 +182,7 @@ class DataParallelPPOActor(BasePPOActor):
                     **multi_modal_inputs,
                     use_cache=False,
                     **extra_args,
-                )  # prevent model thinks we are generating
+                )  # prevent model thinks we are upda
 
                 if self.use_fused_kernels:
                     log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
@@ -575,9 +575,19 @@ class DataParallelPPOActor(BasePPOActor):
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
-        mini_batches = data.split(self.config.ppo_mini_batch_size)
+
+        # import pdb; pdb.set_trace()
+
+        mini_batch = len(data) // 2
+        mini_batches = data.split(mini_batch)
+
+        print(f"[INFO] len mini_batches: {len(mini_batches)}, split_batch: {mini_batch}", flush=True)
+
+        # import pdb; pdb.set_trace()
 
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
+
+        # print(f"[INFO] len mini_batches: {len(mini_batches)}", flush=True)
 
         save_gradient = self.config.get("save_gradient", False)
         save_this_step = False

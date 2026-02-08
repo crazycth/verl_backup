@@ -70,7 +70,7 @@ from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
-from verl.utils.metric import reduce_metrics
+from verl.utils.metric import reduce_metrics, reduce_metrics_with_key
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
@@ -837,6 +837,49 @@ class RayPPOTrainer:
         )
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
+    
+
+    def _save_temp_checkpoint(self, folder_name):
+        import shutil
+        import os
+        import torch
+        from verl.utils.fs import local_mkdir_safe
+
+        local_folder = folder_name
+        print(f"[INFO][_save_temp_checkpoint] Saving temp checkpoint to {local_folder}", flush=True)
+
+        if os.path.exists(local_folder):
+            print(f"[INFO][_save_temp_checkpoint] Target folder exists, Removing: {local_folder}", flush=True)
+            shutil.rmtree(local_folder)
+
+        local_mkdir_safe(local_folder)
+
+        actor_local_path = os.path.join(local_folder, "actor")
+        self.actor_rollout_wg.save_checkpoint(
+            actor_local_path, 
+            None,
+            self.global_steps,
+            max_ckpt_to_keep=None
+        )
+
+        print(f"[INFO][_save_temp_checkpoint] Successfully Saved temp checkpoint to {local_folder}", flush=True)
+
+
+
+    def _load_temp_checkpoint(self, folder_name):
+        import os
+
+        if not os.path.exists(folder_name):
+            raise FileNotFoundError(f"Temporary checkpoint not found at: {folder_name}")
+        
+        actor_path = os.path.join(folder_name, "actor")
+
+        self.actor_rollout_wg.load_checkpoint(
+            actor_path,
+            del_local_after_load=False
+        )
+
+        print(f"[INFO][_load_temp_checkpoint] Successfully Loaded temp checkpoint from {folder_name}", flush=True)
 
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":
@@ -978,7 +1021,7 @@ class RayPPOTrainer:
         return batch, {}
     
 
-    def post_process(self, batch, method, entropy):
+    def post_process(self, batch, method, entropy=None):
         import numpy as np
         from collections import defaultdict
 
@@ -1310,6 +1353,8 @@ class RayPPOTrainer:
 
                 gen_batch = self._get_gen_batch(batch)
 
+                # import pdb; pdb.set_trace()
+
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
                 gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
@@ -1347,7 +1392,10 @@ class RayPPOTrainer:
 
                             del gen_baseline_batch, gen_baseline_output
                     # repeat to align with repeated responses in rollout
+                    # import pdb; pdb.set_trace()
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+
+                    # import pdb; pdb.set_trace()
                     batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
@@ -1374,6 +1422,7 @@ class RayPPOTrainer:
                         else:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
+                    # import pdb; pdb.set_trace()
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
@@ -1440,6 +1489,137 @@ class RayPPOTrainer:
                             "norm_adv_by_std_in_grpo", True
                         )  # GRPO adv normalization factor
 
+                        # batch = compute_advantage(
+                        #     batch,
+                        #     adv_estimator=self.config.algorithm.adv_estimator,
+                        #     gamma=self.config.algorithm.gamma,
+                        #     lam=self.config.algorithm.lam,
+                        #     num_repeat=self.config.actor_rollout_ref.rollout.n,
+                        #     norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                        #     config=self.config.algorithm,
+                        # )
+                    
+                    # batch-post-process part
+                    # post_process = self.config.trainer.get("post_process", None)
+                    # if post_process and len(post_process) > 0:
+                    #     print(f"[INFO] use post_process here, method: {post_process}", flush=True)
+                    #     batch, post_metrics = self.post_process(batch, post_process, entropy=global_old_entropys)
+                    #     metrics.update(post_metrics)
+                    
+                    # import pdb; pdb.set_trace()
+
+
+                    # update critic -> False
+                    # if self.use_critic:
+                    #     with marked_timer("update_critic", timing_raw, color="pink"):
+                    #         critic_output = self.critic_wg.update_critic(batch)
+                    #     critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+                    #     metrics.update(critic_output_metrics)
+                    
+
+                    # implement critic warmup
+                    # if self.config.trainer.critic_warmup <= self.global_steps:
+                    #     # update actor
+                    #     with marked_timer("update_actor", timing_raw, color="red"):
+                    #         batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable # False
+                    #         actor_output = self.actor_rollout_wg.update_actor(batch)
+                    #     actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                    #     metrics.update(actor_output_metrics)
+
+                    # Log rollout generations if enabled
+                    rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+                    if rollout_data_dir:
+                        self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+                    
+                    # import pdb; pdb.set_trace()
+                    # recompute logprob after update policy
+                    recompute_logprob_after = self.config.trainer.get("recompute_logprob_after", False)
+                    recompute_logprob_step = self.config.trainer.get("recompute_logprob_step")
+                    print(f"[INFO] recompute logprob after: {recompute_logprob_after}, recompute logprob step: {recompute_logprob_step}", flush=True)
+                    # import pdb; pdb.set_trace()
+                    recompute_this_step = False
+                    if recompute_logprob_after and self.global_steps % recompute_logprob_step == 0:
+                        recompute_this_step = True
+                    
+                    print(f"[INFO] global step: {self.global_steps}, recompute logprob this step: {recompute_this_step}", flush=True)
+
+                    def to_cpu(t):
+                        if isinstance(t, torch.Tensor):
+                            return t.detach().cpu()
+                        return t
+                    
+                    def recompute_logprob(batch):
+                        logprob_batch_key = ["input_ids", "attention_mask", "position_ids", "responses"]
+                        logprob_batch = batch.select(batch_keys=logprob_batch_key)
+
+                        # for current batch
+                        # old_logprobs = batch.batch.get("old_log_probs")
+                        # old_entropys = global_old_entropys
+                        # response_masks = batch.batch["response_mask"]
+
+                        # recompute logprobs after update
+                        logprob_after = self.actor_rollout_wg.compute_log_prob(logprob_batch)
+                        current_logprob = logprob_after.batch["old_log_probs"]
+                        current_entropys = logprob_after.batch["entropys"]
+
+                        data = {
+                            "logprob_after": to_cpu(current_logprob),
+                            "current_entropys": to_cpu(current_entropys)
+                        }
+
+                        return data
+
+                    if recompute_this_step:
+                        tmp_folder_name = self.config.trainer.get("default_local_dir")
+                        tmp_folder_name = os.path.join(tmp_folder_name, f"tmp")
+                        self._save_temp_checkpoint(folder_name=tmp_folder_name)
+
+                        # PSR Update
+                        psr_batch = copy.deepcopy(batch)
+                        psr_batch.meta_info["multi_turn"] = False
+                        psr_batch = compute_advantage(
+                            psr_batch,
+                            adv_estimator=AdvantageEstimator.GRPO,
+                            gamma=self.config.algorithm.gamma,
+                            lam=self.config.algorithm.lam,
+                            num_repeat=self.config.actor_rollout_ref.rollout.n,
+                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                            config=self.config.algorithm,
+                        )
+                        psr_batch, post_metrics = self.post_process(psr_batch, "posonly")
+                        psr_actor_output = self.actor_rollout_wg.update_actor(psr_batch)
+                        psr_output_metrics = reduce_metrics_with_key(psr_actor_output.meta_info["metrics"], "psr")
+                        metrics.update(psr_output_metrics)
+                        psr_logprob_data = recompute_logprob(psr_batch)
+
+                        # import pdb; pdb.set_trace()
+
+                        del psr_batch
+                        
+
+                        # NSR Update
+                        self._load_temp_checkpoint(folder_name=tmp_folder_name)
+                        nsr_batch = copy.deepcopy(batch)
+                        nsr_batch.meta_info["multi_turn"] = False
+                        nsr_batch = compute_advantage(
+                            nsr_batch,
+                            adv_estimator=AdvantageEstimator.GRPO,
+                            gamma=self.config.algorithm.gamma,
+                            lam=self.config.algorithm.lam,
+                            num_repeat=self.config.actor_rollout_ref.rollout.n,
+                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                            config=self.config.algorithm,
+                        )
+                        nsr_batch, post_metrics = self.post_process(nsr_batch, "negonly")
+                        nsr_actor_output = self.actor_rollout_wg.update_actor(nsr_batch)
+                        nsr_output_metrics = reduce_metrics_with_key(nsr_actor_output.meta_info["metrics"], "nsr")
+                        metrics.update(nsr_output_metrics)
+                        nsr_logprob_data = recompute_logprob(nsr_batch)
+                        
+                        del nsr_batch
+
+                        # GRPO Update
+                        self._load_temp_checkpoint(folder_name=tmp_folder_name)
                         batch = compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
@@ -1449,119 +1629,133 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
-                    
-                    # batch-post-process part
-                    post_process = self.config.trainer.get("post_process", None)
-                    if post_process and len(post_process) > 0:
-                        print(f"[INFO] use post_process here, method: {post_process}", flush=True)
-                        batch, post_metrics = self.post_process(batch, post_process, entropy=global_old_entropys)
-                        metrics.update(post_metrics)
-                    
-                    # import pdb; pdb.set_trace()
+                        grpo_actor_output = self.actor_rollout_wg.update_actor(batch)
+                        grpo_output_metrics = reduce_metrics(grpo_actor_output.meta_info["metrics"])
+                        metrics.update(grpo_output_metrics)
+                        grpo_logprob_data = recompute_logprob(batch)
 
 
-                    # update critic
-                    if self.use_critic:
-                        with marked_timer("update_critic", timing_raw, color="pink"):
-                            critic_output = self.critic_wg.update_critic(batch)
-                        critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
-                        metrics.update(critic_output_metrics)
-                    
+                        # Save LogProbs
+                        # import pdb; pdb.set_trace()
+                        dump_dir = self.config.trainer.get("dump_dir")
+                        if not os.path.exists(dump_dir):
+                            os.makedirs(dump_dir)
+                        dump_path = os.path.join(dump_dir, f"step_{self.global_steps}.pt")
 
-                    # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
-                        # update actor
+                        dump_data = {
+                            'input_ids': to_cpu(batch.batch.get('input_ids')),
+                            'old_log_probs': to_cpu(batch.batch.get('old_log_probs')),
+                            'response_masks': to_cpu(batch.batch.get('response_mask')),
+                            'responses': to_cpu(batch.batch.get('responses')),
+
+                            'uuid': batch.non_tensor_batch.get('uuid'),
+                            'score': batch.non_tensor_batch.get('score'),
+
+                            'psr_logprob_after': to_cpu(psr_logprob_data.get('logprob_after')),
+                            'nsr_logprob_after': to_cpu(nsr_logprob_data.get('logprob_after')),
+                            'grpo_logprob_after': to_cpu(grpo_logprob_data.get('logprob_after')),
+
+                            'psr_current_entropys': to_cpu(psr_logprob_data.get('current_entropys')),
+                            'nsr_current_entropys': to_cpu(nsr_logprob_data.get('current_entropys')),
+                            'grpo_current_entropys': to_cpu(grpo_logprob_data.get('current_entropys')),
+                        }
+                        torch.save(dump_data, dump_path)
+                        print(f"[INFO dumping data to {dump_path}]", flush=True)
+
+                        # import pdb; pdb.set_trace()
+
+                    else:
+                        # use normal grpo update
+                        print(f"[INFO use noraml grpo update, step: {self.global_steps}", flush=True)
+                        batch = compute_advantage(
+                            batch,
+                            adv_estimator=self.config.algorithm.adv_estimator,
+                            gamma=self.config.algorithm.gamma,
+                            lam=self.config.algorithm.lam,
+                            num_repeat=self.config.actor_rollout_ref.rollout.n,
+                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                            config=self.config.algorithm,
+                        )
                         with marked_timer("update_actor", timing_raw, color="red"):
-                            batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
-                    # Log rollout generations if enabled
-                    rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-                    if rollout_data_dir:
-                        self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
-                    
 
-                    # recompute logprob after update policy
-                    recompute_logprob_after = self.config.trainer.get("recompute_logprob_after", False)
+                        
 
-                    def to_cpu(t):
-                        if isinstance(t, torch.Tensor):
-                            return t.detach().cpu()
-                        return t
+                    # if recompute_logprob_after:
+                        # print(f"[INFO] recompute logprob after policy update", flush=True)
+                        # import pdb; pdb.set_trace()
+                        # with marked_timer("recompute_logprob_after", timing_raw, color="blue"):
+                        #     logprob_batch_key = ["input_ids", "attention_mask", "position_ids", "responses"]
+                        #     logprob_batch = batch.select(batch_keys=logprob_batch_key)
 
-                    if recompute_logprob_after:
-                        print(f"[INFO] recompute logprob after policy update", flush=True)
-                        with marked_timer("recompute_logprob_after", timing_raw, color="blue"):
-                            logprob_batch_key = ["input_ids", "attention_mask", "position_ids", "responses"]
-                            logprob_batch = batch.select(batch_keys=logprob_batch_key)
+                        #     # for current batch
+                        #     old_logprobs = batch.batch.get("old_log_probs")
+                        #     old_entropys = global_old_entropys
+                        #     response_masks = batch.batch["response_mask"]
 
-                            # for current batch
-                            old_logprobs = batch.batch.get("old_log_probs")
-                            old_entropys = global_old_entropys
-                            response_masks = batch.batch["response_mask"]
+                        #     # recompute logprobs after update
+                        #     logprob_after = self.actor_rollout_wg.compute_log_prob(logprob_batch)
+                        #     current_logprob = logprob_after.batch["old_log_probs"]
+                        #     current_entropys = logprob_after.batch["entropys"]
 
-                            # recompute logprobs after update
-                            logprob_after = self.actor_rollout_wg.compute_log_prob(logprob_batch)
-                            current_logprob = logprob_after.batch["old_log_probs"]
-                            current_entropys = logprob_after.batch["entropys"]
+                        #     # import pdb; pdb.set_trace()
 
-                            # import pdb; pdb.set_trace()
+                        #     # wandb log
+                        #     logprob_diff = current_logprob - old_logprobs
+                        #     logprob_diff_masked_mean = masked_mean(logprob_diff, response_masks)
 
-                            # wandb log
-                            logprob_diff = current_logprob - old_logprobs
-                            logprob_diff_masked_mean = masked_mean(logprob_diff, response_masks)
+                        #     pos_rollout_idx = batch.non_tensor_batch['score'] > 0
+                        #     neg_rollout_idx = batch.non_tensor_batch['score'] <= 0
 
-                            pos_rollout_idx = batch.non_tensor_batch['score'] > 0
-                            neg_rollout_idx = batch.non_tensor_batch['score'] <= 0
+                        #     logprob_diff_pos = masked_mean(logprob_diff[pos_rollout_idx], response_masks[pos_rollout_idx])
+                        #     logprob_diff_neg = masked_mean(logprob_diff[neg_rollout_idx], response_masks[neg_rollout_idx])
 
-                            logprob_diff_pos = masked_mean(logprob_diff[pos_rollout_idx], response_masks[pos_rollout_idx])
-                            logprob_diff_neg = masked_mean(logprob_diff[neg_rollout_idx], response_masks[neg_rollout_idx])
+                        #     entropy_diff = current_entropys - old_entropys
+                        #     entropy_diff_masked_mean = masked_mean(entropy_diff, response_masks)
+                        #     pos_entropy_diff = masked_mean(entropy_diff[pos_rollout_idx], response_masks[pos_rollout_idx])
+                        #     neg_entropy_diff = masked_mean(entropy_diff[neg_rollout_idx], response_masks[neg_rollout_idx])
 
-                            entropy_diff = current_entropys - old_entropys
-                            entropy_diff_masked_mean = masked_mean(entropy_diff, response_masks)
-                            pos_entropy_diff = masked_mean(entropy_diff[pos_rollout_idx], response_masks[pos_rollout_idx])
-                            neg_entropy_diff = masked_mean(entropy_diff[neg_rollout_idx], response_masks[neg_rollout_idx])
+                        #     metric_dict = {
+                        #         "dynamic/logprob_diff/mean": logprob_diff_masked_mean,
+                        #         "dynamic/logprob_diff/mean/pos": logprob_diff_pos,
+                        #         "dynamic/logprob_diff/mean/neg": logprob_diff_neg,
 
-                            metric_dict = {
-                                "dynamic/logprob_diff/mean": logprob_diff_masked_mean,
-                                "dynamic/logprob_diff/mean/pos": logprob_diff_pos,
-                                "dynamic/logprob_diff/mean/neg": logprob_diff_neg,
-
-                                "dynamic/entropy_diff/mean": entropy_diff_masked_mean,
-                                "dynamic/entropy_diff/mean/pos": pos_entropy_diff,
-                                "dynamic/entropy_diff/mean/neg": neg_entropy_diff
-                            }
-                            metrics.update(metric_dict)
+                        #         "dynamic/entropy_diff/mean": entropy_diff_masked_mean,
+                        #         "dynamic/entropy_diff/mean/pos": pos_entropy_diff,
+                        #         "dynamic/entropy_diff/mean/neg": neg_entropy_diff
+                        #     }
+                        #     metrics.update(metric_dict)
 
 
-                            # dump to local
-                            # import pdb; pdb.set_trace()
-                            dump_dir = self.config.trainer.get("dump_dir")
-                            if not os.path.exists(dump_dir):
-                                os.makedirs(dump_dir)
-                            dump_path = os.path.join(dump_dir, f"step_{self.global_steps}.pt")
-                            dump_data = {
-                                    # --- From batch.batch (Tensors) ---
-                                    'input_ids': to_cpu(batch.batch.get('input_ids')),
-                                    'old_log_probs': to_cpu(batch.batch.get('old_log_probs')),
-                                    'response_masks': to_cpu(batch.batch.get('response_mask')), # 注意代码里原本使用的是 response_mask
-                                    'responses': to_cpu(batch.batch.get('responses')),
+                        #     # dump to local
+                        #     # import pdb; pdb.set_trace()
+                        #     dump_dir = self.config.trainer.get("dump_dir")
+                        #     if not os.path.exists(dump_dir):
+                        #         os.makedirs(dump_dir)
+                        #     dump_path = os.path.join(dump_dir, f"step_{self.global_steps}.pt")
+                        #     dump_data = {
+                        #             # --- From batch.batch (Tensors) ---
+                        #             'input_ids': to_cpu(batch.batch.get('input_ids')),
+                        #             'old_log_probs': to_cpu(batch.batch.get('old_log_probs')),
+                        #             'response_masks': to_cpu(batch.batch.get('response_mask')), # 注意代码里原本使用的是 response_mask
+                        #             'responses': to_cpu(batch.batch.get('responses')),
                                     
-                                    # --- From batch.non_tensor_batch (List/Meta) ---
-                                    'uuid': batch.non_tensor_batch.get('uuid'),
-                                    'score': batch.non_tensor_batch.get('score'),
+                        #             # --- From batch.non_tensor_batch (List/Meta) ---
+                        #             'uuid': batch.non_tensor_batch.get('uuid'),
+                        #             'score': batch.non_tensor_batch.get('score'),
                                     
-                                    # --- Computed Values ---
-                                    # 这里保存 current_logprob，即 update 后的 logprob
-                                    'logprob_after': to_cpu(current_logprob), 
-                                    'old_entropys': to_cpu(old_entropys),
-                                    'current_entropys': to_cpu(current_entropys)
-                                }
-                            print(f"[INFO] Dumping debug data to {dump_path}", flush=True)
-                            torch.save(dump_data, dump_path)
-                            # import pdb; pdb.set_trace()
+                        #             # --- Computed Values ---
+                        #             # 这里保存 current_logprob，即 update 后的 logprob
+                        #             'logprob_after': to_cpu(current_logprob), 
+                        #             'old_entropys': to_cpu(old_entropys),
+                        #             'current_entropys': to_cpu(current_entropys)
+                        #         }
+                        #     print(f"[INFO] Dumping debug data to {dump_path}", flush=True)
+                        #     torch.save(dump_data, dump_path)
+                        #     # import pdb; pdb.set_trace()
 
 
 
