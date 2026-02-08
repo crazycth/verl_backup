@@ -179,7 +179,8 @@ class RLHFDataset(Dataset):
         
         drop_keys = ["uuid"]
         for key in drop_keys:
-            data.pop(key)
+            if key in data:
+                data.pop(key)
         
         input_ids = data['input_ids']
         response_masks = data['response_masks']

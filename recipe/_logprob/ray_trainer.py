@@ -869,6 +869,7 @@ class RayPPOTrainer:
     #     )
 
     #     self.global_steps = 0
+    #     # import pdb; pdb.set_trace()
 
     #     # load checkpoint before doing anything
     #     self._load_checkpoint()
@@ -1111,7 +1112,7 @@ class RayPPOTrainer:
                 config=self.config.algorithm,
             )
 
-            # import pdb; pdb.set_trace()
+            import pdb; pdb.set_trace()
 
             timestamp = time.strftime("%Y%m%d_%H%M%S")
 
