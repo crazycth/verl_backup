@@ -90,6 +90,8 @@ def compute_rollout_importance_weights(
             metrics: Dictionary of IS statistics and mismatch metrics (KL, PPL, etc.),
                 all converted to scalars and prefixed with "mismatch/"
     """
+
+    print(f"[INFO][mismatch] rollout_is_level: {rollout_is_level}, rollout_is_mode: {rollout_is_mode}, rollout_is_threshold: {rollout_is_threshold}", flush=True)
     if rollout_is_threshold is None:
         return None, {}
 

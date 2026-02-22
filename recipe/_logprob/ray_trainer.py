@@ -1112,12 +1112,12 @@ class RayPPOTrainer:
                 config=self.config.algorithm,
             )
 
-            import pdb; pdb.set_trace()
+            # import pdb; pdb.set_trace()
 
             timestamp = time.strftime("%Y%m%d_%H%M%S")
 
             for i in range(80):
-                grpo_actor_output = self.actor_rollout_wg.update_actor(batch)
+                grpo_actor_output = self.actor_rollout_wg.update_actor_onpolicydistill(batch)
                 print(f"[INFO] update step: {i}", flush=True)
                 print(f"[INFO] output: {grpo_actor_output}", flush=True)
 
@@ -1170,7 +1170,7 @@ class RayPPOTrainer:
                     "score": batch.non_tensor_batch["score"]
                 }
 
-                dump_path = f"/home/ma-user/work/dev/_experiments/verl/_psrnsr/EXP44_128_64/playground/ablation_bs/bs{tune_bs}_{timestamp}/{i}.pt"
+                dump_path = f"/home/ma-user/work/dev/_experiments/verl/_psrnsr/EXP44_128_64/playground/onpolicy-distill/{timestamp}/{i}.pt"
                 os.makedirs(os.path.dirname(dump_path), exist_ok=True)
                 torch.save(dump_data, dump_path)
 

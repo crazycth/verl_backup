@@ -46,8 +46,8 @@ from verl.trainer.config import AlgoConfig
 # from verl.trainer.ppo import core_algos
 # from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 
-from recipe._psrnsr import core_algos
-from recipe._psrnsr.core_algos import AdvantageEstimator, agg_loss
+from recipe._opd import core_algos
+from recipe._opd.core_algos import AdvantageEstimator, agg_loss
 
 
 # from verl.trainer.ppo.metric_utils import (
@@ -56,7 +56,7 @@ from recipe._psrnsr.core_algos import AdvantageEstimator, agg_loss
 #     compute_timing_metrics,
 #     process_validation_metrics,
 # )
-from recipe._psrnsr.metric_utils import (
+from recipe._opd.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
@@ -74,7 +74,8 @@ from verl.utils.metric import reduce_metrics, reduce_metrics_with_key
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
-from verl.utils.tracking import ValidationGenerationsLogger, SwanLabTableLogger
+# from verl.utils.tracking import ValidationGenerationsLogger, SwanLabTableLogger
+from recipe._opd.tracking import ValidationGenerationsLogger, SwanLabTableLogger
 
 
 @dataclass
@@ -242,6 +243,24 @@ def compute_advantage(
                 config.pf_ppo.get("reweight_method"),
                 config.pf_ppo.get("weight_pow"),
             )
+    elif adv_estimator == AdvantageEstimator.OPD:
+        # Standard on-policy distillation advantage:
+        # advantages = teacher_log_probs - student_log_probs  (response-aligned, token-level)
+        if "ref_log_prob" in data.batch:
+            teacher_log_probs = data.batch["ref_log_prob"]
+        else:
+            raise KeyError(
+                "OPD requires teacher logprobs in batch: expected `ref_log_prob` (preferred) "
+                "or `rollout_logprobs`."
+            )
+        advantages, returns = core_algos.compute_opd_outcome_advantage(
+            student_log_probs=data.batch["old_log_probs"],
+            teacher_log_probs=teacher_log_probs,
+            response_mask=data.batch["response_mask"],
+            config=config,
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
     elif adv_estimator == AdvantageEstimator.GRPO:
         # Initialize the mask for GRPO calculation
         grpo_calculation_mask = data.batch["response_mask"]
@@ -518,6 +537,7 @@ class RayPPOTrainer:
         # Log to each configured logger
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
+
     def _maybe_log_rollout_generations(self, batch, key="rollout"):
         """Log rollout generations grouped by binary score.
 
@@ -547,8 +567,8 @@ class RayPPOTrainer:
         rng.shuffle(idx_score_0)
         rng.shuffle(idx_score_1)
 
-        idx_score_0 = idx_score_0[:100]
-        idx_score_1 = idx_score_1[:100]
+        idx_score_0 = idx_score_0[:50]
+        idx_score_1 = idx_score_1[:50]
 
         swanlab_data = []
         for i in idx_score_0 + idx_score_1:
@@ -1421,26 +1441,7 @@ class RayPPOTrainer:
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
 
-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
-                        if self.reward_fn is None:
-                            raise ValueError("A reward_fn is required for REMAX advantage estimation.")
 
-                        with marked_timer("gen_max", timing_raw, color="purple"):
-                            gen_baseline_batch = deepcopy(gen_batch)
-                            gen_baseline_batch.meta_info["do_sample"] = False
-                            if not self.async_rollout_mode:
-                                gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
-                            else:
-                                gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
-                            batch = batch.union(gen_baseline_output)
-                            reward_baseline_tensor = self.reward_fn(batch)
-                            reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
-
-                            batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
-
-                            batch.batch["reward_baselines"] = reward_baseline_tensor
-
-                            del gen_baseline_batch, gen_baseline_output
                     # repeat to align with repeated responses in rollout
                     # import pdb; pdb.set_trace()
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
@@ -1492,7 +1493,8 @@ class RayPPOTrainer:
                             from verl.utils.debug.metrics import calculate_debug_metrics
 
                             metrics.update(calculate_debug_metrics(batch))
-
+                    
+                    # use opd here -> True
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with marked_timer("ref", timing_raw, color="olive"):
@@ -1501,16 +1503,19 @@ class RayPPOTrainer:
                             else:
                                 ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
+                    
+                    # import pdb; pdb.set_trace()
 
-                    # compute values
-                    if self.use_critic:
-                        with marked_timer("values", timing_raw, color="cyan"):
-                            values = self.critic_wg.compute_values(batch)
-                            batch = batch.union(values)
+                    # compute values -> False
+                    # if self.use_critic:
+                    #     with marked_timer("values", timing_raw, color="cyan"):
+                    #         values = self.critic_wg.compute_values(batch)
+                    #         batch = batch.union(values)
 
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
+                        # self.config.reward_model.launch_reward_fn_async -> False
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         batch.batch["token_level_scores"] = reward_tensor
@@ -1519,6 +1524,9 @@ class RayPPOTrainer:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
                         # compute rewards. apply_kl_penalty if available
+                        print(f"[INFO][_opd][ray_trainer] use_kl_in_reward: {self.config.algorithm.use_kl_in_reward}", flush=True)
+
+                        # self.config.algorithm.use_kl_in_reward -> False
                         if self.config.algorithm.use_kl_in_reward:
                             batch, kl_metrics = apply_kl_penalty(
                                 batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
@@ -1619,140 +1627,25 @@ class RayPPOTrainer:
 
                         return data
 
-                    if recompute_this_step:
-                        tmp_folder_name = self.config.trainer.get("default_local_dir")
-                        tmp_folder_name = os.path.join(tmp_folder_name, f"tmp")
-                        self._save_temp_checkpoint(folder_name=tmp_folder_name)
 
-                        # PSR Update
-                        psr_batch = copy.deepcopy(batch)
-                        psr_batch.meta_info["multi_turn"] = False
-                        psr_batch = compute_advantage(
-                            psr_batch,
-                            adv_estimator=AdvantageEstimator.GRPO,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            config=self.config.algorithm,
-                        )
-                        psr_batch, post_metrics = self.post_process(psr_batch, "posonly")
-                        psr_actor_output = self.actor_rollout_wg.update_actor(psr_batch)
-                        psr_output_metrics = reduce_metrics_with_key(psr_actor_output.meta_info["metrics"], "psr")
-                        metrics.update(psr_output_metrics)
-                        psr_logprob_data = recompute_logprob(psr_batch)
+                    # use normal grpo update
+                    # print(f"[INFO use noraml grpo update, step: {self.global_steps}", flush=True)
+                    batch = compute_advantage(
+                        batch,
+                        adv_estimator=self.config.algorithm.adv_estimator,
+                        gamma=self.config.algorithm.gamma,
+                        lam=self.config.algorithm.lam,
+                        num_repeat=self.config.actor_rollout_ref.rollout.n,
+                        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                        config=self.config.algorithm,
+                    )
+                    with marked_timer("update_actor", timing_raw, color="red"):
+                        actor_output = self.actor_rollout_wg.update_actor(batch)
+                    actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                    metrics.update(actor_output_metrics)
 
-                        # import pdb; pdb.set_trace()
-
-                        del psr_batch
-                        
-
-                        # NSR Update
-                        self._load_temp_checkpoint(folder_name=tmp_folder_name)
-                        nsr_batch = copy.deepcopy(batch)
-                        nsr_batch.meta_info["multi_turn"] = False
-                        nsr_batch = compute_advantage(
-                            nsr_batch,
-                            adv_estimator=AdvantageEstimator.GRPO,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            config=self.config.algorithm,
-                        )
-                        nsr_batch, post_metrics = self.post_process(nsr_batch, "negonly")
-                        nsr_actor_output = self.actor_rollout_wg.update_actor(nsr_batch)
-                        nsr_output_metrics = reduce_metrics_with_key(nsr_actor_output.meta_info["metrics"], "nsr")
-                        metrics.update(nsr_output_metrics)
-                        nsr_logprob_data = recompute_logprob(nsr_batch)
-                        
-                        del nsr_batch
-
-                        # GRPO Update
-                        self._load_temp_checkpoint(folder_name=tmp_folder_name)
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            config=self.config.algorithm,
-                        )
-                        grpo_actor_output = self.actor_rollout_wg.update_actor(batch)
-                        grpo_output_metrics = reduce_metrics(grpo_actor_output.meta_info["metrics"])
-                        metrics.update(grpo_output_metrics)
-                        grpo_logprob_data = recompute_logprob(batch)
-
-
-                        # Save LogProbs
-                        # import pdb; pdb.set_trace()
-                        dump_dir = self.config.trainer.get("dump_dir")
-                        if not os.path.exists(dump_dir):
-                            os.makedirs(dump_dir)
-                        dump_path = os.path.join(dump_dir, f"step_{self.global_steps}.pt")
-
-                        dump_data = {
-                            'input_ids': to_cpu(batch.batch.get('input_ids')),
-                            'old_log_probs': to_cpu(batch.batch.get('old_log_probs')),
-                            'response_masks': to_cpu(batch.batch.get('response_mask')),
-                            'responses': to_cpu(batch.batch.get('responses')),
-
-                            'uuid': batch.non_tensor_batch.get('uuid'),
-                            'score': batch.non_tensor_batch.get('score'),
-
-                            'psr_logprob_after': to_cpu(psr_logprob_data.get('logprob_after')),
-                            'nsr_logprob_after': to_cpu(nsr_logprob_data.get('logprob_after')),
-                            'grpo_logprob_after': to_cpu(grpo_logprob_data.get('logprob_after')),
-
-                            'psr_current_entropys': to_cpu(psr_logprob_data.get('current_entropys')),
-                            'nsr_current_entropys': to_cpu(nsr_logprob_data.get('current_entropys')),
-                            'grpo_current_entropys': to_cpu(grpo_logprob_data.get('current_entropys')),
-                        }
-                        torch.save(dump_data, dump_path)
-                        print(f"[INFO dumping data to {dump_path}]", flush=True)
-
-                        # import pdb; pdb.set_trace()
-
-                    else:
-                        # use normal grpo update
-                        print(f"[INFO use noraml grpo update, step: {self.global_steps}", flush=True)
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            config=self.config.algorithm,
-                        )
-                        with marked_timer("update_actor", timing_raw, color="red"):
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
-                        # import pdb; pdb.set_trace()
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                        response_token_num = torch.sum(batch.batch["response_mask"]).item()
-
-                        div_key = [
-                            # Tokens beyond thresholds (irrespective of whether clipping is applied)
-                            "actor-clip/pg_is_pos_ge_high_tokens_sum",
-                            "actor-clip/pg_is_pos_le_low_tokens_sum",
-                            "actor-clip/pg_is_neg_ge_high_tokens_sum",
-                            "actor-clip/pg_is_neg_le_low_tokens_sum",
-                            # Tokens actually clipped (affected by two-sided clipping switches)
-                            "actor-clip/pg_clip_pos_high_tokens_sum",
-                            "actor-clip/pg_clip_pos_low_tokens_sum",
-                            "actor-clip/pg_clip_neg_high_tokens_sum",
-                            "actor-clip/pg_clip_neg_low_tokens_sum",
-                        ]
-                        div_key.extend([f"actor-clip/pg_is_clip_sum_batch_{i}" for i in range(10)])
-                        for key in div_key:
-                            if key in actor_output_metrics:
-                                actor_output_metrics[key] = actor_output_metrics[key] / response_token_num
-                        actor_output_metrics['actor/response_token_num'] = response_token_num
-                        # import pdb; pdb.set_trace()
-                        metrics.update(actor_output_metrics)
-
-                        self._maybe_log_rollout_generations(batch, key="rollout")
+                    # log to swanlab
+                    self._maybe_log_rollout_generations(batch, key="rollout")
 
 
                         

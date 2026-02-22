@@ -51,6 +51,8 @@ def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
             metrics[key] = np.max(val)
         elif "min" in key:
             metrics[key] = np.min(val)
+        elif "sum" in key:
+            metrics[key] = np.sum(val)
         else:
             metrics[key] = np.mean(val)
     return metrics

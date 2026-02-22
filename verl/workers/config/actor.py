@@ -68,6 +68,14 @@ class ActorConfig(BaseConfig):
         clip_ratio (float): PPO clipping ratio for policy loss.
         clip_ratio_low (float): Lower bound for PPO clipping ratio.
         clip_ratio_high (float): Upper bound for PPO clipping ratio.
+        clip_upper_two_sided (bool): Whether to clip the *upper* ratio bound for both positive and
+            negative advantages (used by certain PPO loss variants such as "vanilla-twin").
+        clip_lower_two_sided (bool): Whether to clip the *lower* ratio bound for both positive and
+            negative advantages (used by certain PPO loss variants such as "vanilla-twin").
+        entropy_preserve (bool): Whether to preserve top-entropy tokens from two-sided clipping.
+            When enabled, the top 20% highest-entropy response tokens will use *one-sided* clipping
+            (pos: upper only, neg: lower only), while the remaining tokens follow the two-sided
+            clipping switches.
         policy_loss (PolicyLossConfig): Configuration for policy loss computation.
         clip_ratio_c (float): Clipping ratio for critic loss.
         loss_agg_mode (str): Loss aggregation mode. Options: 'token-mean', 'sample-mean'.
@@ -101,6 +109,11 @@ class ActorConfig(BaseConfig):
     clip_ratio: float = 0.2
     clip_ratio_low: float = 0.2
     clip_ratio_high: float = 0.2
+    
+    clip_upper_two_sided: bool = True
+    clip_lower_two_sided: bool = True
+    entropy_preserve: bool = False
+
     freeze_vision_tower: bool = False
     policy_loss: PolicyLossConfig = field(default_factory=PolicyLossConfig)
     clip_ratio_c: float = 3.0

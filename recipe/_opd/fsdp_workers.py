@@ -737,8 +737,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
         # from verl.workers.actor import DataParallelPPOActor
-        # from recipe._psrnsr.dp_actor import DataParallelPPOActor
-        from recipe._logprob.dp_actor import DataParallelPPOActor
+        from recipe._opd.dp_actor import DataParallelPPOActor
 
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
@@ -807,6 +806,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             if self.rank == 0:
                 print("reference model:", ref_model_path)
             local_path = copy_to_local(ref_model_path, use_shm=use_shm)
+            print(f"[INFO][fsdp_workers] build ref path: {local_path}", flush=True)
             self.ref_module_fsdp = self._build_model_optimizer(
                 model_path=local_path,
                 fsdp_config=omega_conf_to_dataclass(self.config.ref.fsdp_config),
@@ -887,55 +887,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(optimizer=self.actor_optimizer)
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
-
-        return output
-
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
-    @DistProfiler.annotate(color="green", role="actor_opd_update")
-    def update_actor_onpolicydistill(self, data: DataProto):
-        """On-Policy Distillation update.
-
-        Wraps DataParallelPPOActor.update_policy_opd with FSDP offloading logic.
-        The method:
-          1. Forward-computes current student log_probs
-          2. Uses teacher logprobs (rollout_logprobs) and old student logprobs
-             to compute advantages = teacher - old_student
-          3. Applies PPO clipped loss and does one gradient step
-        """
-        assert self._is_actor
-        if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.actor_module_fsdp)
-        if self._is_offload_optimizer:
-            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
-
-        with self.ulysses_sharding_manager:
-            data = data.to("cpu")  # data will to device with each micro batch on actor
-
-            with Timer(name="update_policy_opd", logger=None) as timer:
-                metrics = self.actor.update_policy_opd(data=data)
-            delta_time = timer.last
-            global_num_tokens = data.meta_info["global_token_num"]
-            estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
-            metrics["perf/mfu/actor"] = (
-                estimated_flops / promised_flops / self.world_size
-            )
-            metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
-            metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
-            metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
-
-            lr = self.actor_lr_scheduler.get_last_lr()[0]
-            metrics["actor/lr"] = lr
-            self.actor_lr_scheduler.step()
-
-            output = DataProto(meta_info={"metrics": metrics})
-            output = output.to("cpu")
-
-        if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-            log_gpu_memory_usage("After offload actor model during update_actor_onpolicydistill", logger=logger)
-        if self._is_offload_optimizer:
-            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
-            log_gpu_memory_usage("After offload actor optimizer during update_actor_onpolicydistill", logger=logger)
 
         return output
 

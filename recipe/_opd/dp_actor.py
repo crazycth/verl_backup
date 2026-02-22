@@ -30,8 +30,7 @@ import torch.distributed as dist
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-# from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
-from recipe._psrnsr.core_algos import agg_loss, get_policy_loss_fn, kl_penalty, get_global_entropy_top_mask
+from recipe._opd.core_algos import agg_loss, get_policy_loss_fn, kl_penalty, get_global_entropy_top_mask
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -42,8 +41,6 @@ from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
-
-from recipe._psrnsr.gradient_layers import NAME2LAYER
 
 __all__ = ["DataParallelPPOActor"]
 
@@ -182,7 +179,7 @@ class DataParallelPPOActor(BasePPOActor):
                     **multi_modal_inputs,
                     use_cache=False,
                     **extra_args,
-                )  # prevent model thinks we are upda
+                )  # prevent model thinks we are generating
 
                 if self.use_fused_kernels:
                     log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
@@ -422,243 +419,7 @@ class DataParallelPPOActor(BasePPOActor):
         neg_data = data.select_idxs(neg_mask_torch)
         
         return pos_data, neg_data
-    
 
-    def gradient_analysis(self, data, gradient_path, is_pos=True):
-        from verl.protocol import all_gather_data_proto
-        import copy
-        
-        # 1. Gather all data to form a global view
-        # We operate on a shallow copy to preserve original data structure for training loop
-        global_data = copy.copy(data)
-        all_gather_data_proto(global_data, process_group=None) # Uses default PG (World)
-
-        print(f"[INFO][gradient_analysis][dp_actor] all_gather global batch size: {len(global_data)}, is_pos: {is_pos}", flush=True)
-
-        # 2. Split into positive and negative samples
-        temperature = data.meta_info["temperature"]
-        pos_data, neg_data = self._split_pos_neg(global_data)
-        
-        target_data = pos_data if is_pos else neg_data
-        
-        # 3. Process in groups of 8
-        dp_size = dist.get_world_size()
-        group_size = 8 
-        
-        num_samples = len(target_data)
-        num_groups = num_samples // group_size
-
-        num_groups = min(num_groups, 20)
-        
-        if dist.get_rank() == 0:
-            print(f"[INFO] Gradient Analysis: Found {num_samples} samples ({'Pos' if is_pos else 'Neg'}). "
-                  f"Processing {num_groups} groups of size {group_size}.", flush=True)
-
-        for i in range(num_groups):
-            start_idx = i * group_size
-            end_idx = start_idx + group_size
-            
-            # Select the sub-batch
-            indices = torch.arange(start_idx, end_idx)
-            sub_batch = target_data.select_idxs(indices)
-            
-            # Distribute to current rank
-            rank = dist.get_rank()
-            
-            if len(sub_batch) < dp_size:
-                continue
-
-            local_chunk = sub_batch.chunk(dp_size)[rank]
-            
-            if len(local_chunk) == 0:
-                continue
-                
-            # Prepare inputs
-            local_chunk = local_chunk.to(get_device_id())
-            model_inputs = {**local_chunk.batch, **local_chunk.non_tensor_batch}
-            
-            # Zero grad
-            self.actor_optimizer.zero_grad()
-            
-            # Forward
-            entropy, log_prob = self._forward_micro_batch(
-                model_inputs, temperature=temperature, calculate_entropy=False
-            )
-            
-            # --- Recompute Loss ---
-            response_mask = model_inputs["response_mask"]
-            old_log_prob = model_inputs["old_log_probs"]
-            advantages = model_inputs["advantages"]
-            
-            loss_agg_mode = self.config.loss_agg_mode
-            loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
-            rollout_is_weights = model_inputs.get("rollout_is_weights", None)
-            policy_loss_fn = get_policy_loss_fn(loss_mode)
-
-            pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
-                old_log_prob=old_log_prob,
-                log_prob=log_prob,
-                advantages=advantages,
-                response_mask=response_mask,
-                loss_agg_mode=loss_agg_mode,
-                config=self.config,
-                rollout_is_weights=rollout_is_weights,
-            )
-            
-            policy_loss = pg_loss
-            
-            if self.config.use_kl_loss:
-                ref_log_prob = model_inputs["ref_log_prob"]
-                kld = kl_penalty(log_prob, ref_log_prob, self.config.kl_loss_type)
-                kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-                policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
-
-            loss = policy_loss
-            loss.backward()
-            
-            # Save Gradient
-            label = "pos" if is_pos else "neg"
-            label_path = os.path.join(gradient_path, f"step_{self.gradient_step}", label)
-            if not os.path.exists(label_path):
-                os.makedirs(label_path, exist_ok=True)
-            label_file = os.path.join(label_path, f"group_{i}.pt")
-
-            dump_layer_config = self.config.get("layer_name")
-            all_param_names = NAME2LAYER[dump_layer_config]
-
-            self._rank0_summon(label_file, layers=all_param_names)
-            
-            # Clear grad
-            self.actor_optimizer.zero_grad()
-            
-        if dist.get_rank() == 0:
-            print(f"[INFO] Gradient Analysis ({'Pos' if is_pos else 'Neg'}) Complete.", flush=True)
-        
-        dist.barrier()
-        
-
-
-
-
-    @GPUMemoryLogger(role="dp actor", logger=logger)
-    def update_policy_opd(self, data: DataProto):
-        """On-Policy Distillation (OPD) update — one gradient step.
-
-        Aligned with slime's implementation:
-          - No IS (importance sampling)
-          - No entropy bonus
-          - No KL loss
-          - Pure PPO clipped surrogate with OPD advantages
-
-        Each call:
-          1. Forward current policy → student log_probs
-          2. advantages = teacher_logprobs − old_student_logprobs  (fixed)
-          3. ratio = exp(student_logprobs − old_student_logprobs)
-          4. PPO clipped loss → backward → one optimizer step
-
-        Expected batch keys:
-          - rollout_logprobs : teacher log-probs (pre-computed, fixed)
-          - old_log_probs    : student log-probs at rollout time (PPO anchor)
-          - response_mask    : binary mask over response tokens
-          - input_ids, attention_mask, position_ids, responses
-        """
-        self.actor_module.train()
-        self.gradient_step += 1
-
-        temperature = data.meta_info["temperature"]
-
-        select_keys = [
-            "responses",
-            "response_mask",
-            "input_ids",
-            "attention_mask",
-            "position_ids",
-            "old_log_probs",
-            "rollout_logprobs",
-        ]
-
-        has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
-        non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
-
-        data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
-
-        total_samples = len(data)
-
-        # Split into micro-batches purely for gradient accumulation (memory)
-        # No mini-batch splitting — the entire batch is one update.
-        if self.config.use_dynamic_bsz:
-            max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-            micro_batches, _ = prepare_dynamic_batch(data, max_token_len=max_token_len)
-        else:
-            micro_batches = data.split(self.config.ppo_micro_batch_size_per_gpu)
-
-        self.actor_optimizer.zero_grad()
-
-        metrics = {}
-        loss_agg_mode = self.config.loss_agg_mode
-
-        # PPO clip parameters (same as slime's eps_clip / eps_clip_high)
-        eps_clip = getattr(self.config, "clip_ratio_low", 0.2)
-        eps_clip_high = getattr(self.config, "clip_ratio_high", eps_clip)
-
-        for micro_batch in micro_batches:
-            micro_batch = micro_batch.to(get_device_id())
-            model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
-
-            response_mask = model_inputs["response_mask"]
-            old_log_prob = model_inputs["old_log_probs"]           # student at rollout time
-            teacher_log_prob = model_inputs["rollout_logprobs"]    # teacher logprobs
-
-            # Gradient-accumulation scale factor
-            if self.config.use_dynamic_bsz:
-                loss_scale_factor = response_mask.shape[0] / total_samples
-            else:
-                loss_scale_factor = 1.0 / len(micro_batches)
-
-            # ---- Forward: current policy log_probs (no entropy needed) ----
-            _, log_prob = self._forward_micro_batch(
-                model_inputs, temperature=temperature, calculate_entropy=False
-            )
-
-            # ---- OPD Advantage: teacher − old_student (fixed, detached) ----
-            advantages = (teacher_log_prob - old_log_prob).detach()
-
-            # ---- PPO Clipped Surrogate Loss (aligned with slime) ----
-            # ppo_kl  = old − new   (slime: loss.py:500)
-            # ratio   = exp(−ppo_kl) = exp(new − old)   (slime: ppo_utils.py:127)
-            ppo_kl = old_log_prob - log_prob
-            ratio = (-ppo_kl).exp()
-
-            surr1 = -ratio * advantages
-            surr2 = -torch.clamp(ratio, 1.0 - eps_clip, 1.0 + eps_clip_high) * advantages
-            pg_loss_mat = torch.max(surr1, surr2)
-
-            pg_clipfrac = (surr2 > surr1).float()
-            pg_clipfrac = agg_loss(loss_mat=pg_clipfrac, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-
-            ppo_kl_scalar = agg_loss(loss_mat=ppo_kl, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-            pg_loss = agg_loss(loss_mat=pg_loss_mat, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-
-            # No entropy, no KL loss, no IS — pure OPD
-            loss = pg_loss * loss_scale_factor
-            loss.backward()
-
-            # ---- Metrics ----
-            adv_mean = agg_loss(
-                loss_mat=advantages, loss_mask=response_mask, loss_agg_mode=loss_agg_mode
-            )
-            micro_batch_metrics = {
-                "actor/opd_pg_loss": pg_loss.detach().item() * loss_scale_factor,
-                "actor/opd_clipfrac": pg_clipfrac.detach().item(),
-                "actor/opd_ppo_kl": ppo_kl_scalar.detach().item(),
-                "actor/opd_adv_mean": adv_mean.detach().item(),
-            }
-            append_to_dict(metrics, micro_batch_metrics)
-
-        grad_norm = self._optimizer_step()
-        metrics["actor/grad_norm"] = grad_norm.detach().item()
-        self.actor_optimizer.zero_grad()
-        return metrics
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
@@ -695,45 +456,11 @@ class DataParallelPPOActor(BasePPOActor):
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
-
-        # import pdb; pdb.set_trace()
-
-        mini_batch = len(data) // 2
-        mini_batches = data.split(mini_batch)
-
-        print(f"[INFO] len mini_batches: {len(mini_batches)}, split_batch: {mini_batch}", flush=True)
-
-        # import pdb; pdb.set_trace()
+        mini_batches = data.split(self.config.ppo_mini_batch_size)
 
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
 
-        # print(f"[INFO] len mini_batches: {len(mini_batches)}", flush=True)
-
-        save_gradient = self.config.get("save_gradient", False)
-        save_this_step = False
-        if save_gradient and self.gradient_step % int(self.config.get("gradient_per_step", 100000)) == 0:
-            print(f"[INFO][_psrnsr][dp_actor.py] save gradient this step", flush=True)
-            save_this_step = True
-
-        print(f"[INFO][_psrnsr][dp_actor.py] on_policy here: {on_policy}, save_gradient: {save_gradient}, save_this_step: {save_this_step}", flush=True)
-
-        # import pdb; pdb.set_trace()
-
-        if save_this_step:
-            print(f"[INFO][_psrnsr] gradient analysis for this step", flush=True)
-
-            self.gradient_analysis(data, self.config.gradient_path, is_pos=True)
-            self.actor_optimizer.zero_grad(set_to_none=True)
-            gc.collect()
-            torch.cuda.empty_cache()
-
-            self.gradient_analysis(data, self.config.gradient_path, is_pos=False)
-            self.actor_optimizer.zero_grad(set_to_none=True)
-            gc.collect()
-            torch.cuda.empty_cache()
-
-            self.actor_optimizer.zero_grad()
-            print(f"[INFO][_psrnsr] gradient analysis finish", flush=True)
+        print(f"[INFO][_opd][dp_actor.py] on_policy here: {on_policy}", flush=True)
 
         metrics = {}
         for _ in range(self.config.ppo_epochs):
@@ -811,25 +538,27 @@ class DataParallelPPOActor(BasePPOActor):
                         rollout_is_weights=rollout_is_weights,
                     )
 
-                    if entropy_coeff != 0:
-                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                    # if entropy_coeff != 0:
+                    #     entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
-                        # compute policy loss
-                        policy_loss = pg_loss - entropy_loss * entropy_coeff
-                    else:
-                        policy_loss = pg_loss
+                    #     # compute policy loss
+                    #     policy_loss = pg_loss - entropy_loss * entropy_coeff
+                    # else:
+                    #     policy_loss = pg_loss
 
-                    if self.config.use_kl_loss:
-                        ref_log_prob = model_inputs["ref_log_prob"]
-                        # compute kl loss
-                        kld = kl_penalty(
-                            logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
-                        )
-                        kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                    # if self.config.use_kl_loss:
+                    #     ref_log_prob = model_inputs["ref_log_prob"]
+                    #     # compute kl loss
+                    #     kld = kl_penalty(
+                    #         logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
+                    #     )
+                    #     kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
-                        policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
-                        micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item() * loss_scale_factor
-                        micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
+                    #     policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+                    #     micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item() * loss_scale_factor
+                    #     micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
+
+                    policy_loss = pg_loss
 
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz

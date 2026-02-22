@@ -503,6 +503,7 @@ class DataParallelPPOActor(BasePPOActor):
                 loss_agg_mode=loss_agg_mode,
                 config=self.config,
                 rollout_is_weights=rollout_is_weights,
+                entropy=entropy,
             )
             
             policy_loss = pg_loss
@@ -640,9 +641,10 @@ class DataParallelPPOActor(BasePPOActor):
                     use_token_filter = self.config.get("use_token_filter", False)
                     token_filter_method = self.config.get("token_filter_method", None)
                     entropy_top_ratio = self.config.get('entropy_top_ratio', None)
+                    entropy_preserve = self.config.get("entropy_preserve", False)
                     
 
-                    if entropy_coeff != 0 or use_token_filter:
+                    if entropy_coeff != 0 or use_token_filter or entropy_preserve:
                         calculate_entropy = True
                     entropy, log_prob = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
@@ -662,6 +664,9 @@ class DataParallelPPOActor(BasePPOActor):
                     # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
                     rollout_is_weights = model_inputs.get("rollout_is_weights", None)
 
+
+                    print(f"[INFO] rollout_is_weights: {rollout_is_weights}", flush=True)
+
                     # NOTE: Both mismatch diagnostic metrics (PPL, KL, etc.) and IS weight metrics
                     # are computed centrally in ray_trainer.py for consistency and efficiency.
                     # This ensures metrics are computed uniformly across all batches at the trainer level
@@ -679,6 +684,7 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_agg_mode=loss_agg_mode,
                         config=self.config,
                         rollout_is_weights=rollout_is_weights,
+                        entropy=entropy,
                     )
 
                     if entropy_coeff != 0:
@@ -713,9 +719,24 @@ class DataParallelPPOActor(BasePPOActor):
                             "actor/pg_loss": pg_loss.detach().item() * loss_scale_factor,
                             "actor/pg_clipfrac": pg_clipfrac.detach().item(),
                             "actor/ppo_kl": ppo_kl.detach().item(),
-                            "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
                         }
                     )
+                    # 4th return value may be:
+                    # - a scalar tensor (legacy)
+                    # - a vector tensor (older panel format)
+                    # - a dict[str, tensor] (preferred, more readable)
+                    pg_clip_monitor = pg_clipfrac_lower
+                    if isinstance(pg_clip_monitor, dict):
+                        for k, v in pg_clip_monitor.items():
+                            vv = v.detach() if torch.is_tensor(v) else v
+                            micro_batch_metrics[f"actor-clip/{k}"] = vv.item() if torch.is_tensor(vv) else float(vv)
+                        # Keep legacy key for dashboards that expect it.
+                        # micro_batch_metrics["actor/pg_clipfrac_lower"] = float("nan")
+
+                    if 'actor-clip/pg_is_clip_sum' in micro_batch_metrics:
+                        del micro_batch_metrics['actor-clip/pg_is_clip_sum']
+                        micro_batch_metrics[f"actor-clip/pg_is_clip_sum_batch_{batch_idx}"] = pg_clip_monitor['pg_is_clip_sum']
+
                     append_to_dict(metrics, micro_batch_metrics)
 
                 grad_norm = self._optimizer_step()

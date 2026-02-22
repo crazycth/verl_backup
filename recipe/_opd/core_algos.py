@@ -44,9 +44,7 @@ PolicyLossFn = Callable[
         Optional[DictConfig | AlgoConfig],  # config
         torch.Tensor | None,  # rollout_log_probs
     ],
-    # NOTE: the 4th return value is used for optional diagnostics/monitoring panels.
-    # Different policy losses may return different structures (scalar tensor / vector tensor / dict, etc.).
-    tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
 ]
 
 POLICY_LOSS_REGISTRY: dict[str, PolicyLossFn] = {}
@@ -110,6 +108,7 @@ class AdvantageEstimator(str, Enum):
     PSR = "psr"
     NSR = "nsr"
     PG = "pg"
+    OPD = "opd"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -356,6 +355,48 @@ def compute_policygradient_outcome_advantage(
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores
+
+
+@register_adv_est(AdvantageEstimator.OPD)
+def compute_opd_outcome_advantage(
+    student_log_probs: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    **kwargs: Any,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute advantage for standard On-Policy Distillation (OPD).
+
+    This aligns with slime's OPD advantage construction:
+
+        reverse_kl = student_log_probs - teacher_log_probs
+        advantages = -reverse_kl = teacher_log_probs - student_log_probs
+
+    All tensors are assumed to be response-aligned, i.e. shape (bs, response_len).
+    We mask out padding positions using `response_mask`.
+
+    Args:
+        student_log_probs: Per-token log-probabilities from the student policy at rollout time.
+        teacher_log_probs: Per-token log-probabilities from the teacher (ref) model.
+        response_mask: Binary mask for valid response tokens.
+        epsilon: Unused (kept for signature compatibility).
+        config: Optional algorithm config (unused for now).
+        **kwargs: Forward-compatible extra args (ignored).
+
+    Returns:
+        advantages: Tensor of shape (bs, response_len)
+        returns:    Tensor of shape (bs, response_len) (same as advantages for OPD)
+    """
+
+    if student_log_probs.shape != teacher_log_probs.shape:
+        raise ValueError(f"Shape mismatch: {student_log_probs.shape=} vs {teacher_log_probs.shape=}")
+    if student_log_probs.shape != response_mask.shape:
+        raise ValueError(f"Shape mismatch: {student_log_probs.shape=} vs {response_mask.shape=}")
+
+    with torch.no_grad():
+        adv = (teacher_log_probs - student_log_probs).to(torch.float32)
+        adv = adv * response_mask.to(dtype=adv.dtype)
+
+    return adv, adv
 
 
 @register_adv_est(AdvantageEstimator.PSR)
@@ -974,8 +1015,8 @@ def compute_policy_loss_vanilla(
     loss_agg_mode: str = "token-mean",
     config: Optional[DictConfig | AlgoConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
-    entropy: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any]:
+    entropy_top_mask: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the clipped policy objective and related metrics for PPO.
 
@@ -995,9 +1036,8 @@ def compute_policy_loss_vanilla(
             Aggregation mode for `agg_loss`. Defaults to "token-mean".
         config: `(verl.trainer.config.ActorConfig)`:
             config for the actor.
-        rollout_is_weights: `(torch.Tensor)`:
-            Optional per-token importance sampling weights to apply to the policy-gradient loss,
-            shape (batch_size, response_length).
+        rollout_log_probs: `(torch.Tensor)`:
+            log probabilities of actions under the rollout policy, shape (batch_size, response_length).
     """
 
     assert config is not None
@@ -1029,168 +1069,22 @@ def compute_policy_loss_vanilla(
     )  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
     pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
 
-    # Clip monitoring panel (returned as the 4th output, for logging/diagnostics)
-    # Thresholds are controlled by clip_ratio_low/high:
-    #   low  threshold: (1 - clip_ratio_low)
-    #   high threshold: (1 + clip_ratio_high)
-    token_mask = response_mask > 0
-    pos_mask = (advantages > 0) & token_mask
-    neg_mask = (advantages < 0) & token_mask
-    high_thr = 1 + cliprange_high
-    low_thr = 1 - cliprange_low
-    pg_clip_panel = {
-        "pg_is_pos_ge_high_tokens_sum": ((ratio >= high_thr) & pos_mask).sum(),
-        "pg_is_pos_le_low_tokens_sum": ((ratio <= low_thr) & pos_mask).sum(),
-        "pg_is_neg_ge_high_tokens_sum": ((ratio >= high_thr) & neg_mask).sum(),
-        "pg_is_neg_le_low_tokens_sum": ((ratio <= low_thr) & neg_mask).sum(),
-    }
-
-    # Standard PPO clipped objective (no dual-clip)
+    # Standard PPO clip (no dual-clip).
+    pg_clipfrac_lower = torch.zeros((), device=log_prob.device, dtype=pg_clipfrac.dtype)
     pg_losses = clip_pg_losses1
 
     # Apply rollout importance sampling weights if provided
     if rollout_is_weights is not None:
         pg_losses = pg_losses * rollout_is_weights
-
-    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, advantages=advantages)
-
-    return pg_loss, pg_clipfrac, ppo_kl, pg_clip_panel
-
-
-
-@register_policy_loss("vanilla-twin")  # type: ignore[arg-type]
-def compute_policy_loss_vanilla_twin(
-    old_log_prob: torch.Tensor,
-    log_prob: torch.Tensor,
-    advantages: torch.Tensor,
-    response_mask: torch.Tensor,
-    loss_agg_mode: str = "token-mean",
-    config: Optional[DictConfig | AlgoConfig] = None,
-    rollout_is_weights: torch.Tensor | None = None,
-    entropy: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any]:
-    """
-    Compute the clipped policy objective and related metrics for PPO.
-
-    Adapted from
-    https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py#L1122
-
-    Args:
-        old_log_prob (torch.Tensor):
-            Log-probabilities of actions under the old policy, shape (batch_size, response_length).
-        log_prob (torch.Tensor):
-            Log-probabilities of actions under the current policy, shape (batch_size, response_length).
-        advantages (torch.Tensor):
-            Advantage estimates for each action, shape (batch_size, response_length).
-        response_mask (torch.Tensor):
-            Mask indicating which tokens to include in the loss, shape (batch_size, response_length).
-        loss_agg_mode (str, optional):
-            Aggregation mode for `agg_loss`. Defaults to "token-mean".
-        config: `(verl.trainer.config.ActorConfig)`:
-            config for the actor.
-        rollout_is_weights: `(torch.Tensor)`:
-            Optional per-token importance sampling weights to apply to the policy-gradient loss,
-            shape (batch_size, response_length).
-    """
-    assert config is not None
-    assert not isinstance(config, AlgoConfig)
-    clip_ratio = config.clip_ratio  # Clipping parameter ε for standard PPO. See https://arxiv.org/abs/1707.06347.
-    clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_ratio
-    clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_ratio
-
-    cliprange = clip_ratio
-    cliprange_low = clip_ratio_low
-    cliprange_high = clip_ratio_high
-
-    negative_approx_kl = log_prob - old_log_prob
-    # Clamp negative_approx_kl for stability
-    negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
-    ratio = torch.exp(negative_approx_kl)
-    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
-
-    # Controls for whether ratio clipping is "two-sided" w.r.t. advantage sign.
-    # Defaults preserve standard PPO behavior:
-    #   - Upper bound clip applies to positive-advantage tokens only
-    #   - Lower bound clip applies to negative-advantage tokens only
-    # NOTE: default=True keeps backward-compatible behavior with older configs that
-    # didn't have these fields (historically "vanilla-twin" clipped both sides for all tokens).
-    clip_upper_two_sided = bool(config.get("clip_upper_two_sided", True))
-    clip_lower_two_sided = bool(config.get("clip_lower_two_sided", True))
-
-    high_thr = 1 + cliprange_high
-    low_thr = 1 - cliprange_low
-
-    token_mask = response_mask > 0
-    pos_mask = (advantages > 0) & token_mask
-    neg_mask = (advantages < 0) & token_mask
-
-    # Optional entropy-preserve: top-entropy tokens are immune to two-sided clipping and use one-sided clip only.
-    # - preserved tokens: pos -> upper only, neg -> lower only
-    # - remaining tokens: follow clip_upper_two_sided / clip_lower_two_sided
-    entropy_preserve = bool(config.get("entropy_preserve", False))
-    if entropy_preserve and entropy is not None:
-        preserve_mask = get_global_entropy_top_mask(entropy=entropy, response_mask=token_mask, top_ratio=0.2).bool()
-        preserve_mask = preserve_mask & token_mask
+    
+    if entropy_top_mask is None:
+        pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, advantages=advantages)
     else:
-        preserve_mask = torch.zeros_like(token_mask, dtype=torch.bool)
-    non_preserve_mask = token_mask & (~preserve_mask)
+        print(f"[INFO][vanilla] use entropy_top_mask to agg loss", flush=True)
+        pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask * entropy_top_mask, loss_agg_mode=loss_agg_mode, advantages=advantages)
 
-    print(f"[INFO][vanilla-twin] entropy_preserve: {entropy_preserve}, clip_ratio_low: {clip_ratio_low}, clip_ratio_high: {clip_ratio_high}, clip_upper_two_sided: {clip_upper_two_sided}, clip_lower_two_sided: {clip_lower_two_sided}", flush=True)
+    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
-    # Apply upper/lower bound clipping selectively by advantage sign.
-    # Upper: default clip positive only; when clip_upper_two_sided=True, clip both pos & neg.
-    # Lower: default clip negative only; when clip_lower_two_sided=True, clip both pos & neg.
-    # If entropy_preserve=True: preserved tokens always use one-sided (pos upper only, neg lower only).
-    apply_high_mask = (pos_mask & preserve_mask) | (
-        (pos_mask | (neg_mask if clip_upper_two_sided else torch.zeros_like(pos_mask))) & non_preserve_mask
-    )
-    apply_low_mask = (neg_mask & preserve_mask) | (
-        (neg_mask | (pos_mask if clip_lower_two_sided else torch.zeros_like(pos_mask))) & non_preserve_mask
-    )
-
-    high_thr_t = ratio.new_tensor(high_thr)
-    low_thr_t = ratio.new_tensor(low_thr)
-    high_clip_mask = (ratio > high_thr) & apply_high_mask
-    low_clip_mask = (ratio < low_thr) & apply_low_mask
-
-    ratio_clipped = ratio
-    ratio_clipped = torch.where(high_clip_mask, high_thr_t, ratio_clipped)
-    ratio_clipped = torch.where(low_clip_mask, low_thr_t, ratio_clipped)
-
-    ratio_was_clipped = high_clip_mask | low_clip_mask
-    pg_clipfrac = verl_F.masked_mean(ratio_was_clipped.float(), response_mask)
-
-    # Clip monitoring panel (returned as the 4th output, for logging/diagnostics)
-    # Thresholds are controlled by clip_ratio_low/high:
-    #   low  threshold: (1 - clip_ratio_low)
-    #   high threshold: (1 + clip_ratio_high)
-    pg_clip_panel = {
-        "pg_is_pos_ge_high_tokens_sum": ((ratio >= high_thr) & pos_mask).sum(),
-        "pg_is_pos_le_low_tokens_sum": ((ratio <= low_thr) & pos_mask).sum(),
-        "pg_is_neg_ge_high_tokens_sum": ((ratio >= high_thr) & neg_mask).sum(),
-        "pg_is_neg_le_low_tokens_sum": ((ratio <= low_thr) & neg_mask).sum(),
-
-        # Actual clips applied (after considering advantage sign and two-sided switches)
-        "pg_clip_pos_high_tokens_sum": (high_clip_mask & pos_mask).sum(),
-        "pg_clip_pos_low_tokens_sum": (low_clip_mask & pos_mask).sum(),
-        "pg_clip_neg_high_tokens_sum": (high_clip_mask & neg_mask).sum(),
-        "pg_clip_neg_low_tokens_sum": (low_clip_mask & neg_mask).sum(),
-
-        "pg_is_clip_sum": (ratio_was_clipped & token_mask).sum().item()
-        # "pg_is_any_ge_high_tokens_sum": ((ratio >= high_thr) & token_mask).sum(),
-        # "pg_is_any_le_low_tokens_sum": ((ratio <= low_thr) & token_mask).sum(),
-    }
-
-    # Ratio-clamp PG objective (upper/lower clipping controlled by the two-sided switches)
-    pg_losses = -advantages * ratio_clipped
-
-    # Apply rollout importance sampling weights if provided
-    if rollout_is_weights is not None:
-        pg_losses = pg_losses * rollout_is_weights
-
-    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, advantages=advantages)
-
-    return pg_loss, pg_clipfrac, ppo_kl, pg_clip_panel
 
 
 
@@ -1203,7 +1097,6 @@ def compute_policy_loss_vanilla_posneg(
     loss_agg_mode: str = "token-mean",
     config: Optional[DictConfig | AlgoConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
-    entropy: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the clipped policy objective and related metrics for PPO.
@@ -1300,7 +1193,6 @@ def compute_policy_loss_gspo(
     loss_agg_mode: str = "seq-mean-token-mean",
     config: Optional[DictConfig | ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
-    entropy: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the clipped policy objective and related metrics for GSPO.
@@ -1371,7 +1263,6 @@ def compute_policy_loss_gpg(
     loss_agg_mode: str = "token-mean",
     config: Optional[DictConfig | AlgoConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
-    entropy: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Adapted from
     https://github.com/AMAP-ML/GPG/blob/main/VisualThinker-R1-Zero/src/open-r1-multimodal/src/open_r1/trainer/grpo_trainer.py#L495
@@ -1405,7 +1296,6 @@ def compute_policy_loss_clip_cov(
     loss_agg_mode: str = "token-mean",
     config: Optional[DictConfig | AlgoConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
-    entropy: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the clipped policy objective and related metrics for Clip-Cov.
@@ -1506,7 +1396,6 @@ def compute_policy_loss_kl_cov(
     loss_agg_mode: str = "token-mean",
     config: Optional[DictConfig | AlgoConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
-    entropy: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the clipped policy objective and related metrics for Clip-Cov.
@@ -1583,7 +1472,6 @@ def compute_policy_loss_geo_mean(
     loss_agg_mode: str = "token-mean",
     config: Optional[DictConfig | AlgoConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
-    entropy: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the clipped policy objective and related metrics for GMPO.
