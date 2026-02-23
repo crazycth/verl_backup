@@ -1027,6 +1027,59 @@ class RayPPOTrainer:
         )
         metrics.update(global_balance_stats)
 
+    def _balance_batch_couple(self, batch: DataProto, metrics, logging_prefix="prompt_order"):
+        """Keep rollouts grouped by prompt (prompt-major ordering).
+
+        Example for rollout_n=8: prompt1 x8, prompt2 x8, ..., promptK x8.
+        This preserves prompt grouping and avoids any cross-prompt interleaving.
+        """
+        rollout_n = self.config.actor_rollout_ref.rollout.n
+        batch_size = len(batch)
+        if rollout_n <= 1:
+            return
+        if batch_size % rollout_n != 0:
+            metrics[f"{logging_prefix}/invalid_grouping"] = True
+            return
+
+        num_prompts = batch_size // rollout_n
+        reorder_idx = torch.tensor(
+            [p * rollout_n + i for p in range(num_prompts) for i in range(rollout_n)], device=batch.batch.device
+        )
+        batch.reorder(reorder_idx)
+        metrics[f"{logging_prefix}/num_prompts"] = num_prompts
+
+    def _balance_batch_balance(self, batch: DataProto, metrics, logging_prefix="prompt_round_robin"):
+        """Interleave rollouts across prompts to balance token usage across ranks.
+
+        Example for rollout_n=8 and 128 prompts:
+        prompt1_r1, prompt2_r1, ..., prompt128_r1, prompt1_r2, prompt2_r2, ...
+        """
+        rollout_n = self.config.actor_rollout_ref.rollout.n
+        batch_size = len(batch)
+        if rollout_n <= 1:
+            return
+        if batch_size % rollout_n != 0:
+            metrics[f"{logging_prefix}/invalid_grouping"] = True
+            return
+
+        num_prompts = batch_size // rollout_n
+        reorder_idx = torch.tensor(
+            [p * rollout_n + r for r in range(rollout_n) for p in range(num_prompts)], device=batch.batch.device
+        )
+        batch.reorder(reorder_idx)
+        metrics[f"{logging_prefix}/num_prompts"] = num_prompts
+        metrics[f"{logging_prefix}/rollout_n"] = rollout_n
+
+    def _balance_batch_random(self, batch: DataProto, metrics, logging_prefix="random_shuffle"):
+        """Randomly shuffle the batch (no length balancing)."""
+        batch_size = len(batch)
+        if batch_size <= 1:
+            return
+
+        reorder_idx = torch.randperm(batch_size, device=batch.batch.device)
+        batch.reorder(reorder_idx)
+        metrics[f"{logging_prefix}/applied"] = True
+
     def compute_rollout_importance_weights_and_add_to_batch(self, batch: DataProto) -> tuple[DataProto, dict]:
         """Compute rollout importance sampling weights and mismatch metrics, conditionally add weights to batch.
 
@@ -1456,7 +1509,21 @@ class RayPPOTrainer:
                     # but might affect the loss calculation (due to the change of mini-batching).
                     # TODO: Decouple the DP balancing and mini-batching.
                     if self.config.trainer.balance_batch:
-                        self._balance_batch(batch, metrics=metrics)
+                        balance_method = self.config.trainer.get("balance_method", None)
+                        print(f"[INFO] balance method: {balance_method}", flush=True)
+
+                        # import pdb; pdb.set_trace()
+
+                        if balance_method == "couple":
+                            self._balance_batch_couple(batch, metrics=metrics)
+                        elif balance_method == "balance":
+                            self._balance_batch_balance(batch, metrics=metrics)
+                        elif balance_method == "random":
+                            self._balance_batch_random(batch, metrics=metrics)
+                        else:
+                            self._balance_batch(batch, metrics=metrics)
+                    
+                    # import pdb; pdb.set_trace()
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()

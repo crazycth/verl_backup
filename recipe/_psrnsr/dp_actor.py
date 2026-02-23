@@ -620,6 +620,10 @@ class DataParallelPPOActor(BasePPOActor):
 
                 self.actor_optimizer.zero_grad()
 
+                # import pdb; pdb.set_trace()
+
+                print(f"[INFO][dp_actor] diff prompt size in minibatch: {len(set(mini_batch.non_tensor_batch['uid']))}", flush=True)
+
                 for micro_batch in micro_batches:
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
