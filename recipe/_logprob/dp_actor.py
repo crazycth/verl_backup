@@ -92,8 +92,8 @@ class DataParallelPPOActor(BasePPOActor):
         self.gradient_step = 0
 
     def _forward_micro_batch(
-        self, micro_batch, temperature, calculate_entropy=False
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self, micro_batch, temperature, calculate_entropy=False, phi_enable: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         Returns:
             entropy: # (bs, response_len)
@@ -187,6 +187,8 @@ class DataParallelPPOActor(BasePPOActor):
                 if self.use_fused_kernels:
                     log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
                     entropy_rmpad = output.entropy.squeeze(0)  # (total_nnz,)
+                    if phi_enable:
+                        raise NotImplementedError("phi_enable not supported with fused kernels in rmpad path")
 
                 else:
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
@@ -227,6 +229,13 @@ class DataParallelPPOActor(BasePPOActor):
                             unpad_dim=0,
                             padding_size=pad_size,
                         )
+                    if phi_enable and not self.use_fused_kernels:
+                        logits_rmpad = gather_outputs_and_unpad(
+                            logits_rmpad,
+                            gather_dim=0,
+                            unpad_dim=0,
+                            padding_size=pad_size,
+                        )
                 # pad back to (bsz, seqlen)
                 if calculate_entropy:
                     full_entropy = pad_input(
@@ -241,11 +250,22 @@ class DataParallelPPOActor(BasePPOActor):
                     batch=batch_size,
                     seqlen=seqlen,
                 )
+                full_logits = None
+                if phi_enable and not self.use_fused_kernels:
+                    full_logits = pad_input(
+                        hidden_states=logits_rmpad,
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
 
                 # only return response part:
                 if calculate_entropy:
                     entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
+                logits = None
+                if phi_enable and not self.use_fused_kernels and full_logits is not None:
+                    logits = full_logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
 
             else:  # not using rmpad and no ulysses sp
                 extra_args = {}
@@ -265,6 +285,9 @@ class DataParallelPPOActor(BasePPOActor):
                 if self.use_fused_kernels:
                     log_probs = output.log_probs[:, -response_length - 1 : -1]
                     entropy = output.entropy[:, -response_length - 1 : -1]  # (bsz, response_length)
+                    logits = None
+                    if phi_enable:
+                        raise NotImplementedError("phi_enable not supported with fused kernels")
 
                 else:
                     logits = output.logits
@@ -278,7 +301,7 @@ class DataParallelPPOActor(BasePPOActor):
                         else:
                             entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
 
-            return entropy, log_probs
+            return entropy, log_probs, logits
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -302,7 +325,7 @@ class DataParallelPPOActor(BasePPOActor):
         return grad_norm
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
-    def compute_log_prob(self, data: DataProto, calculate_entropy=False) -> torch.Tensor:
+    def compute_log_prob(self, data: DataProto, calculate_entropy=False) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
 
         Args:
@@ -332,6 +355,8 @@ class DataParallelPPOActor(BasePPOActor):
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
+        print(f"[INFO][dp_actor] use_dynamic_bsz: {use_dynamic_bsz}", flush=True)
+
         if use_dynamic_bsz:
             max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
             micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
@@ -340,28 +365,52 @@ class DataParallelPPOActor(BasePPOActor):
 
         log_probs_lst = []
         entropy_lst = []
+        phi_topk_ids_lst = []
+        phi_topk_logprobs_lst = []
+        phi_enable = bool(data.meta_info.get("phi_enable", False))
+        phi_topk_k = int(data.meta_info.get("phi_topk_k", 100))
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
-                entropy, log_probs = self._forward_micro_batch(
-                    model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                entropy, log_probs, logits = self._forward_micro_batch(
+                    model_inputs, temperature=temperature, calculate_entropy=calculate_entropy, phi_enable=phi_enable
                 )
             log_probs_lst.append(log_probs)
             if calculate_entropy:
                 entropy_lst.append(entropy)
+            if phi_enable:
+                vocab_dim = logits.size(-1)
+                topk_k = min(phi_topk_k, vocab_dim)
+                logsumexp = torch.logsumexp(logits, dim=-1, keepdim=True)
+                topk_vals, topk_ids = torch.topk(logits, k=topk_k, dim=-1)
+                topk_logprobs = topk_vals - logsumexp
+                phi_topk_ids_lst.append(topk_ids.cpu())
+                phi_topk_logprobs_lst.append(topk_logprobs.cpu())
 
         log_probs = torch.concat(log_probs_lst, dim=0)
         entropys = None
         if calculate_entropy:
             entropys = torch.concat(entropy_lst, dim=0)
+        phi_topk_ids = None
+        phi_topk_logprobs = None
+        if phi_enable:
+            phi_topk_ids = torch.concat(phi_topk_ids_lst, dim=0)
+            phi_topk_logprobs = torch.concat(phi_topk_logprobs_lst, dim=0)
 
         if use_dynamic_bsz:
             log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
             if calculate_entropy:
                 entropys = restore_dynamic_batch(entropys, batch_idx_list)
+            if phi_enable:
+                phi_topk_ids = restore_dynamic_batch(phi_topk_ids, batch_idx_list)
+                phi_topk_logprobs = restore_dynamic_batch(phi_topk_logprobs, batch_idx_list)
 
-        return log_probs, entropys
+        phi_out = None
+        if phi_enable:
+            phi_out = (phi_topk_ids, phi_topk_logprobs)
+
+        return log_probs, entropys, phi_out
     
 
     def _rank0_summon(self, path, layers):

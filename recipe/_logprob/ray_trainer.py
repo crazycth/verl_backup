@@ -24,6 +24,7 @@ import uuid
 import copy
 import time
 from collections import defaultdict
+import math
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pprint import pprint
@@ -76,6 +77,7 @@ from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
+from recipe._logprob.phi_utils import compute_phi
 
 
 @dataclass
@@ -850,6 +852,104 @@ class RayPPOTrainer:
         
 
 
+    def fit(self):
+        """
+        The training loop of PPO.
+        The driver process only need to call the compute functions of the worker group through RPC
+        to construct the PPO dataflow.
+        The light-weight advantage computation is done on the driver process.
+        """
+        from omegaconf import OmegaConf
+
+        from verl.utils.tracking import Tracking
+
+        logger = Tracking(
+            project_name=self.config.trainer.project_name,
+            experiment_name=self.config.trainer.experiment_name,
+            default_backend=self.config.trainer.logger,
+            config=OmegaConf.to_container(self.config, resolve=True),
+        )
+
+        self.global_steps = 0
+        # import pdb; pdb.set_trace()
+
+        # load checkpoint before doing anything
+        self._load_checkpoint()
+
+        # we start from step 1
+        self.global_steps += 1
+
+        for batch_dict in self.train_dataloader:
+            metrics = {}
+            timing_raw = {}
+
+            new_batch_dict = {}
+            for k,v in batch_dict.items():
+                if hasattr(v, 'shape') and v.shape[0] == 1:
+                    new_batch_dict[k] = v[0]
+                elif isinstance(v, list) and len(v) == 1:
+                    new_batch_dict[k] = v[0]
+                else:
+                    new_batch_dict[k] = v
+
+            batch: DataProto = DataProto.from_single_dict(new_batch_dict)
+
+            # Process samples in configurable chunks to control memory (default 1).
+            dump_chunk_size = int(self.config.phi.get("dump_batch_size", 4))
+            print(f"[INFO] dump_chunk_size: {dump_chunk_size}", flush=True)
+            batch_size = len(batch)
+            total_chunks = math.ceil(batch_size / dump_chunk_size)
+            for chunk_idx, start_idx in enumerate(tqdm(range(0, batch_size, dump_chunk_size))):
+                end_idx = min(start_idx + dump_chunk_size, batch_size)
+                sample_chunk = batch[start_idx:end_idx]
+
+                logprob_batch_key = ["input_ids", "attention_mask", "position_ids", "responses"]
+                logprob_batch = sample_chunk.select(batch_keys=logprob_batch_key)
+                # enable phi top-k computation on worker if configured
+                logprob_batch.meta_info["phi_enable"] = bool(self.config.phi.enable)
+                logprob_batch.meta_info["phi_topk_k"] = int(self.config.phi.get("topk_k", 100))
+
+                print(f"[INFO] start calculate logprobs for samples {start_idx}:{end_idx}", flush=True)
+                logprob_after = self.actor_rollout_wg.compute_log_prob(logprob_batch)
+                print(f"[INFO] end calculate logprobs for samples {start_idx}:{end_idx}", flush=True)
+
+                import pdb; pdb.set_trace()
+
+                dump_data = {
+                    "input_ids": sample_chunk.batch["input_ids"].cpu(),
+                    "response_masks": sample_chunk.batch["response_masks"].cpu(),
+                }
+
+                dump_data["old_log_probs"] = (
+                    sample_chunk.batch["old_log_probs"].cpu() if "old_log_probs" in sample_chunk.batch else None
+                )
+                if "grpo_current_entropys" in sample_chunk.batch:
+                    dump_data["grpo_current_entropys"] = sample_chunk.batch["grpo_current_entropys"].cpu()
+
+                phi_topk_ids = None
+                phi_topk_logprobs = None
+                if logprob_after.batch is not None:
+                    phi_topk_ids = logprob_after.batch.get("phi_topk_ids", None)
+                    phi_topk_logprobs = logprob_after.batch.get("phi_topk_logprobs", None)
+                dump_data["phi_topk_ids"] = phi_topk_ids.cpu() if phi_topk_ids is not None else None
+                dump_data["phi_topk_logprobs"] = phi_topk_logprobs.cpu() if phi_topk_logprobs is not None else None
+
+                del logprob_after
+                torch.cuda.empty_cache()
+
+                dump_path_base = self.config.phi.get("save_path", None) or self.config.data.save_path
+
+                os.makedirs(dump_path_base, exist_ok=True)
+                chunk_global_idx = chunk_idx + (self.global_steps - 1) * total_chunks
+                dump_path = os.path.join(dump_path_base, f"chunk{chunk_global_idx}.pt")
+                torch.save(dump_data, dump_path)
+                print(f"[INFO] save dump data to {dump_path}", flush=True)
+
+            self.global_steps += 1
+            print(f"[INFO] finish solve all samples", flush=True)
+
+
+
     # def fit(self):
     #     """
     #     The training loop of PPO.
@@ -869,7 +969,6 @@ class RayPPOTrainer:
     #     )
 
     #     self.global_steps = 0
-    #     # import pdb; pdb.set_trace()
 
     #     # load checkpoint before doing anything
     #     self._load_checkpoint()
@@ -894,330 +993,243 @@ class RayPPOTrainer:
 
     #         # import pdb; pdb.set_trace()
 
-    #         logprob_batch_key = ["input_ids", "attention_mask", "position_ids", "responses"]
-    #         logprob_batch = batch.select(batch_keys=logprob_batch_key)
-
-    #         # recompute logprob after
-    #         print(f"[INFO] start calculate logprobs", flush=True)
-    #         logprob_after = self.actor_rollout_wg.compute_log_prob(logprob_batch)
-    #         logprobs = logprob_after.batch['old_log_probs']
-    #         entropys = logprob_after.batch['entropys']
-    #         # logdiff = batch.batch['grpo_logprob_after'] - logprobs
-
-    #         print(f"[INFO] end calculate logprobs", flush=True)
-
-    #         dump_data = {
-    #             "input_ids": batch.batch['input_ids'],
-    #             'attention_mask': batch.batch["attention_mask"],
-
-    #             "grpo_logprob_after": batch.batch["grpo_logprob_after"],
-    #             "nsr_logprob_after": batch.batch["nsr_logprob_after"],
-    #             "psr_logprob_after": batch.batch["psr_logprob_after"],
-
-    #             "rollout_logprobs": logprobs,
-    #             "rollout_entropys": entropys,
-
-
-    #             "old_log_probs": batch.batch["old_log_probs"],
-    #             "response_masks": batch.batch["response_masks"],
-    #             "responses": batch.batch["responses"],
-
-    #             "grpo_current_entropys": batch.batch["grpo_current_entropys"],
-    #             "nsr_current_entropys": batch.batch["nsr_current_entropys"],
-    #             "psr_current_entropys": batch.batch["psr_current_entropys"],
-
-    #             "score": batch.non_tensor_batch["score"]
-    #         }
+    #         # ------------------------------------------------------------------
+    #         # 从标量 outcome score 构造逐 token 的 reward / score
+    #         # 说明：
+    #         # - 当前批次的任务级得分存放在 batch.non_tensor_batch["score"]，形如 (batch_size,)
+    #         # - 我们希望为每个 response token 构造同一个标量 reward，并用 response_mask 做掩码
+    #         # - 目前没有任何 KL 项，因此 token_level_rewards 与 token_level_scores 相同
+    #         # ------------------------------------------------------------------
+    #         # ------------------------------------------------------------------
+    #         # 修改版：从标量 outcome score 构造 Sparse Reward (仅最后一个 token 有分)
+    #         # ------------------------------------------------------------------
 
     #         # import pdb; pdb.set_trace()
-    #         dump_path = self.config.data.save_path
-    #         torch.save(dump_data, dump_path)
-    #         exit(-1)
-
-
-
-    def fit(self):
-        """
-        The training loop of PPO.
-        The driver process only need to call the compute functions of the worker group through RPC
-        to construct the PPO dataflow.
-        The light-weight advantage computation is done on the driver process.
-        """
-        from omegaconf import OmegaConf
-
-        from verl.utils.tracking import Tracking
-
-        logger = Tracking(
-            project_name=self.config.trainer.project_name,
-            experiment_name=self.config.trainer.experiment_name,
-            default_backend=self.config.trainer.logger,
-            config=OmegaConf.to_container(self.config, resolve=True),
-        )
-
-        self.global_steps = 0
-
-        # load checkpoint before doing anything
-        self._load_checkpoint()
-
-        # we start from step 1
-        self.global_steps += 1
-
-        for batch_dict in self.train_dataloader:
-            metrics = {}
-            timing_raw = {}
-
-            new_batch_dict = {}
-            for k,v in batch_dict.items():
-                if hasattr(v, 'shape') and v.shape[0] == 1:
-                    new_batch_dict[k] = v[0]
-                elif isinstance(v, list) and len(v) == 1:
-                    new_batch_dict[k] = v[0]
-                else:
-                    new_batch_dict[k] = v
-
-            batch: DataProto = DataProto.from_single_dict(new_batch_dict)
-
-            # import pdb; pdb.set_trace()
-
-            # ------------------------------------------------------------------
-            # 从标量 outcome score 构造逐 token 的 reward / score
-            # 说明：
-            # - 当前批次的任务级得分存放在 batch.non_tensor_batch["score"]，形如 (batch_size,)
-            # - 我们希望为每个 response token 构造同一个标量 reward，并用 response_mask 做掩码
-            # - 目前没有任何 KL 项，因此 token_level_rewards 与 token_level_scores 相同
-            # ------------------------------------------------------------------
-            # ------------------------------------------------------------------
-            # 修改版：从标量 outcome score 构造 Sparse Reward (仅最后一个 token 有分)
-            # ------------------------------------------------------------------
-
-            # import pdb; pdb.set_trace()
             
-            # 1) 取出标量得分
-            scores_np = batch.non_tensor_batch["score"]  # (B,)
-            scores = torch.as_tensor(
-                scores_np,
-                dtype=torch.float32,
-                device=batch.batch["responses"].device,
-            )  # (B,)
+    #         # 1) 取出标量得分
+    #         scores_np = batch.non_tensor_batch["score"]  # (B,)
+    #         scores = torch.as_tensor(
+    #             scores_np,
+    #             dtype=torch.float32,
+    #             device=batch.batch["responses"].device,
+    #         )  # (B,)
 
-            # 2) 【关键修改】必须先获取 response_mask，因为我们需要用它来确定“哪里是最后一个位置”
-            if "response_masks" in batch.batch:
-                response_mask = batch.batch["response_masks"]
+    #         # 2) 【关键修改】必须先获取 response_mask，因为我们需要用它来确定“哪里是最后一个位置”
+    #         if "response_masks" in batch.batch:
+    #             response_mask = batch.batch["response_masks"]
 
-            # 3) 初始化全 0 的 token_level_scores
-            response_length = batch.batch["responses"].size(1)
-            batch_size = scores.size(0)
-            token_level_scores = torch.zeros(
-                (batch_size, response_length), 
-                dtype=scores.dtype, 
-                device=scores.device
-            )
+    #         # 3) 初始化全 0 的 token_level_scores
+    #         response_length = batch.batch["responses"].size(1)
+    #         batch_size = scores.size(0)
+    #         token_level_scores = torch.zeros(
+    #             (batch_size, response_length), 
+    #             dtype=scores.dtype, 
+    #             device=scores.device
+    #         )
 
-            # 4) 计算每个样本最后一个有效 token 的索引
-            #    假设 mask 是 [1, 1, 1, 0, 0]，sum 是 3，最后一个有效索引是 2 (即 3-1)
-            #    注意：要确保 response_mask 类型是数值型以便求和
-            seq_lengths = response_mask.sum(dim=1).long() 
-            last_token_indices = seq_lengths - 1
+    #         # 4) 计算每个样本最后一个有效 token 的索引
+    #         #    假设 mask 是 [1, 1, 1, 0, 0]，sum 是 3，最后一个有效索引是 2 (即 3-1)
+    #         #    注意：要确保 response_mask 类型是数值型以便求和
+    #         seq_lengths = response_mask.sum(dim=1).long() 
+    #         last_token_indices = seq_lengths - 1
 
-            # 5) 【核心修改】只给最后一个有效位置赋值
-            #    利用高级索引：token_level_scores[行索引, 列索引] = scores
-            #    为了防止全是 padding 的空行导致索引 -1 (虽然极少见)，可以加个 clamp 或断言
-            last_token_indices = last_token_indices.clamp(min=0) 
+    #         # 5) 【核心修改】只给最后一个有效位置赋值
+    #         #    利用高级索引：token_level_scores[行索引, 列索引] = scores
+    #         #    为了防止全是 padding 的空行导致索引 -1 (虽然极少见)，可以加个 clamp 或断言
+    #         last_token_indices = last_token_indices.clamp(min=0) 
             
-            token_level_scores[torch.arange(batch_size, device=scores.device), last_token_indices] = scores
+    #         token_level_scores[torch.arange(batch_size, device=scores.device), last_token_indices] = scores
 
-            # 6) 再次应用 mask (双重保险，确保 padding 位置绝对是 0)
-            token_level_scores = token_level_scores * response_mask
+    #         # 6) 再次应用 mask (双重保险，确保 padding 位置绝对是 0)
+    #         token_level_scores = token_level_scores * response_mask
 
-            # 7) 写回 batch
-            batch.batch["token_level_scores"] = token_level_scores
-            batch.batch["token_level_rewards"] = token_level_scores
+    #         # 7) 写回 batch
+    #         batch.batch["token_level_scores"] = token_level_scores
+    #         batch.batch["token_level_rewards"] = token_level_scores
 
-            # batch.batch["input_ids"] shape: (1024, 16384) -> prefix: (1024, 8192)
-            prefix_len = 8192
-            prompt_prefix = batch.batch["input_ids"][:, :prefix_len]
+    #         # batch.batch["input_ids"] shape: (1024, 16384) -> prefix: (1024, 8192)
+    #         prefix_len = 8192
+    #         prompt_prefix = batch.batch["input_ids"][:, :prefix_len]
 
-            # 2. 使用 torch.unique 按行去重
-            # return_inverse=True 会返回一个索引 tensor，指示原 tensor 中每一行对应 unique 结果中的哪个下标
-            # 这些下标 (0, 1, 2...) 天然就是我们要的组 ID
-            _, uid_indices = torch.unique(prompt_prefix, return_inverse=True, dim=0)
+    #         # 2. 使用 torch.unique 按行去重
+    #         # return_inverse=True 会返回一个索引 tensor，指示原 tensor 中每一行对应 unique 结果中的哪个下标
+    #         # 这些下标 (0, 1, 2...) 天然就是我们要的组 ID
+    #         _, uid_indices = torch.unique(prompt_prefix, return_inverse=True, dim=0)
 
-            # 3. Assert 检查：确认去重后的数量正好是 128
-            num_unique_uids = uid_indices.max().item() + 1
-            expected_repeat = self.config.actor_rollout_ref.rollout.n
-            batch_size = uid_indices.numel()
-            assert batch_size % expected_repeat == 0, (
-                f"Assertion Failed: batch_size={batch_size} is not divisible by rollout.n={expected_repeat}."
-            )
-            expected_prompt_num = batch_size // expected_repeat
-            assert num_unique_uids == expected_prompt_num, (
-                f"Assertion Failed: Expected {expected_prompt_num} unique UIDs based on first {prefix_len} tokens, "
-                f"but found {num_unique_uids}. Please check your batch composition."
-            )
+    #         # 3. Assert 检查：确认去重后的数量正好是 128
+    #         num_unique_uids = uid_indices.max().item() + 1
+    #         expected_repeat = self.config.actor_rollout_ref.rollout.n
+    #         batch_size = uid_indices.numel()
+    #         assert batch_size % expected_repeat == 0, (
+    #             f"Assertion Failed: batch_size={batch_size} is not divisible by rollout.n={expected_repeat}."
+    #         )
+    #         expected_prompt_num = batch_size // expected_repeat
+    #         assert num_unique_uids == expected_prompt_num, (
+    #             f"Assertion Failed: Expected {expected_prompt_num} unique UIDs based on first {prefix_len} tokens, "
+    #             f"but found {num_unique_uids}. Please check your batch composition."
+    #         )
 
-            # 3.1 如果设置了 tune_bs，则只保留前 tune_bs 个 prompt 及其全部 rollouts
-            # import pdb; pdb.set_trace()
-            batch_for_logprob = copy.deepcopy(batch)
-            tune_bs = self.config.data.get("tune_bs", None)
-            print(f"[INFO] tune_bs: {tune_bs}, expected_prompt_num: {expected_prompt_num}", flush=True)
-            if tune_bs is not None:
-                tune_bs = int(tune_bs)
-                assert tune_bs > 0, f"tune_bs must be > 0, got {tune_bs}."
-                assert tune_bs <= expected_prompt_num, (
-                    f"tune_bs must be <= {expected_prompt_num}, got {tune_bs}."
-                )
-                if tune_bs < expected_prompt_num:
-                    # 按首次出现顺序选取 prompt UID
-                    uid_indices_cpu = uid_indices.detach().cpu()
-                    uid_indices_np = uid_indices_cpu.numpy()
-                    first_pos = np.full((num_unique_uids,), batch_size, dtype=np.int64)
-                    for idx, uid in enumerate(uid_indices_np):
-                        if idx < first_pos[uid]:
-                            first_pos[uid] = idx
-                    ordered_uids = np.argsort(first_pos)
-                    uids_to_keep_np = ordered_uids[:tune_bs]
+    #         # 3.1 如果设置了 tune_bs，则只保留前 tune_bs 个 prompt 及其全部 rollouts
+    #         # import pdb; pdb.set_trace()
+    #         batch_for_logprob = copy.deepcopy(batch)
+    #         tune_bs = self.config.data.get("tune_bs", None)
+    #         print(f"[INFO] tune_bs: {tune_bs}, expected_prompt_num: {expected_prompt_num}", flush=True)
+    #         if tune_bs is not None:
+    #             tune_bs = int(tune_bs)
+    #             assert tune_bs > 0, f"tune_bs must be > 0, got {tune_bs}."
+    #             assert tune_bs <= expected_prompt_num, (
+    #                 f"tune_bs must be <= {expected_prompt_num}, got {tune_bs}."
+    #             )
+    #             if tune_bs < expected_prompt_num:
+    #                 # 按首次出现顺序选取 prompt UID
+    #                 uid_indices_cpu = uid_indices.detach().cpu()
+    #                 uid_indices_np = uid_indices_cpu.numpy()
+    #                 first_pos = np.full((num_unique_uids,), batch_size, dtype=np.int64)
+    #                 for idx, uid in enumerate(uid_indices_np):
+    #                     if idx < first_pos[uid]:
+    #                         first_pos[uid] = idx
+    #                 ordered_uids = np.argsort(first_pos)
+    #                 uids_to_keep_np = ordered_uids[:tune_bs]
 
-                    keep_mask = np.isin(uid_indices_np, uids_to_keep_np)
-                    batch = batch.select_idxs(keep_mask)
+    #                 keep_mask = np.isin(uid_indices_np, uids_to_keep_np)
+    #                 batch = batch.select_idxs(keep_mask)
 
-                    # 重新映射 uid，保证从 0..tune_bs-1 的连续编号
-                    uid_map = np.full((num_unique_uids,), -1, dtype=np.int64)
-                    uid_map[uids_to_keep_np] = np.arange(tune_bs, dtype=np.int64)
-                    new_uid = uid_map[uid_indices_np[keep_mask]]
-                    uid_indices = torch.from_numpy(new_uid).to(uid_indices.device)
+    #                 # 重新映射 uid，保证从 0..tune_bs-1 的连续编号
+    #                 uid_map = np.full((num_unique_uids,), -1, dtype=np.int64)
+    #                 uid_map[uids_to_keep_np] = np.arange(tune_bs, dtype=np.int64)
+    #                 new_uid = uid_map[uid_indices_np[keep_mask]]
+    #                 uid_indices = torch.from_numpy(new_uid).to(uid_indices.device)
             
-            # import pdb; pdb.set_trace()
-            print(f"[INFO] len batch: {len(batch)}", flush=True)
+    #         # import pdb; pdb.set_trace()
+    #         print(f"[INFO] len batch: {len(batch)}", flush=True)
 
-            # 4. 将结果存入 batch.non_tensor_batch['uid']
-            # 将 tensor 转为 list (non_tensor_batch 通常存非 tensor 数据)
-            # 这样相同的 prompt 前缀会有相同的整数 ID
-            uid_np = uid_indices.cpu().numpy().astype(np.int64)
-            # import pdb; pdb.set_trace()
+    #         # 4. 将结果存入 batch.non_tensor_batch['uid']
+    #         # 将 tensor 转为 list (non_tensor_batch 通常存非 tensor 数据)
+    #         # 这样相同的 prompt 前缀会有相同的整数 ID
+    #         uid_np = uid_indices.cpu().numpy().astype(np.int64)
+    #         # import pdb; pdb.set_trace()
 
-            batch.non_tensor_batch['uid'] = uid_np
-            batch.meta_info["temperature"] = 1.0
-            batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+    #         batch.non_tensor_batch['uid'] = uid_np
+    #         batch.meta_info["temperature"] = 1.0
+    #         batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
-            # import pdb; pdb.set_trace()
+    #         # import pdb; pdb.set_trace()
 
-            norm_adv_by_std_in_grpo = self.config.get("norm_adv_by_std_in_grpo", True)
-            batch = compute_advantage(
-                batch,
-                adv_estimator=AdvantageEstimator.GRPO,
-                gamma=self.config.algorithm,
-                lam=self.config.algorithm.lam,
-                num_repeat=self.config.actor_rollout_ref.rollout.n,
-                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                config=self.config.algorithm,
-            )
+    #         norm_adv_by_std_in_grpo = self.config.get("norm_adv_by_std_in_grpo", True)
+    #         batch = compute_advantage(
+    #             batch,
+    #             adv_estimator=AdvantageEstimator.GRPO,
+    #             gamma=self.config.algorithm,
+    #             lam=self.config.algorithm.lam,
+    #             num_repeat=self.config.actor_rollout_ref.rollout.n,
+    #             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+    #             config=self.config.algorithm,
+    #         )
 
-            # import pdb; pdb.set_trace()
+    #         # import pdb; pdb.set_trace()
 
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
+    #         timestamp = time.strftime("%Y%m%d_%H%M%S")
 
-            for i in range(80):
-                grpo_actor_output = self.actor_rollout_wg.update_actor_onpolicydistill(batch)
-                print(f"[INFO] update step: {i}", flush=True)
-                print(f"[INFO] output: {grpo_actor_output}", flush=True)
+    #         for i in range(80):
+    #             grpo_actor_output = self.actor_rollout_wg.update_actor_onpolicydistill(batch)
+    #             print(f"[INFO] update step: {i}", flush=True)
+    #             print(f"[INFO] output: {grpo_actor_output}", flush=True)
 
-                # Log worker output metrics (from update_actor) to tracking backends (e.g., wandb).
-                try:
-                    output_metrics = grpo_actor_output.meta_info.get("metrics", {})
-                    output_metrics = reduce_metrics(output_metrics)
-                    output_metrics["train/inner_update_step"] = i
-                    # Ensure monotonically increasing steps for logging.
-                    log_step = int(i)
-                    logger.log(data=output_metrics, step=log_step)
-                except Exception as e:
-                    print(f"[WARN] failed to log update_actor output metrics: {e}", flush=True)
+    #             # Log worker output metrics (from update_actor) to tracking backends (e.g., wandb).
+    #             try:
+    #                 output_metrics = grpo_actor_output.meta_info.get("metrics", {})
+    #                 output_metrics = reduce_metrics(output_metrics)
+    #                 output_metrics["train/inner_update_step"] = i
+    #                 # Ensure monotonically increasing steps for logging.
+    #                 log_step = int(i)
+    #                 logger.log(data=output_metrics, step=log_step)
+    #             except Exception as e:
+    #                 print(f"[WARN] failed to log update_actor output metrics: {e}", flush=True)
 
-                logprob_batch_key = ["input_ids", "attention_mask", "position_ids", "responses"]
-                logprob_batch = batch_for_logprob.select(batch_keys=logprob_batch_key)
-                # logprob_batch.meta_info = batch.meta_info
-                logprob_batch.meta_info["temperature"] = 1.0
-                logprob_batch.meta_info["global_token_num"] = torch.sum(logprob_batch.batch["attention_mask"], dim=-1).tolist()
+    #             logprob_batch_key = ["input_ids", "attention_mask", "position_ids", "responses"]
+    #             logprob_batch = batch_for_logprob.select(batch_keys=logprob_batch_key)
+    #             # logprob_batch.meta_info = batch.meta_info
+    #             logprob_batch.meta_info["temperature"] = 1.0
+    #             logprob_batch.meta_info["global_token_num"] = torch.sum(logprob_batch.batch["attention_mask"], dim=-1).tolist()
+    #             logprob_batch.meta_info["phi_enable"] = bool(self.config.phi.enable)
 
-                # import pdb; pdb.set_trace()
+    #             # import pdb; pdb.set_trace()
 
-                print(f"[INFO] start compute logprobs", flush=True)
-                logprob_after = self.actor_rollout_wg.compute_log_prob(logprob_batch)
+    #             print(f"[INFO] start compute logprobs", flush=True)
+    #             logprob_after = self.actor_rollout_wg.compute_log_prob(logprob_batch)
 
-                logprobs = logprob_after.batch['old_log_probs']
-                entropys = logprob_after.batch['entropys']
+    #             logprobs = logprob_after.batch['old_log_probs']
+    #             entropys = logprob_after.batch['entropys']
+    #             phi_logits = logprob_after.batch.get("phi_logits", None)
 
-                # import pdb; pdb.set_trace()
+    #             # import pdb; pdb.set_trace()
 
-                dump_data = {
-                    "input_ids": batch.batch['input_ids'],
-                    'attention_mask': batch.batch["attention_mask"],
+    #             dump_data = {
+    #                 "input_ids": batch.batch['input_ids'],
+    #                 'attention_mask': batch.batch["attention_mask"],
 
-                    "grpo_logprob_after": batch.batch["grpo_logprob_after"],
-                    "nsr_logprob_after": batch.batch["nsr_logprob_after"],
-                    "psr_logprob_after": batch.batch["psr_logprob_after"],
+    #                 "grpo_logprob_after": batch.batch["grpo_logprob_after"],
+    #                 "nsr_logprob_after": batch.batch["nsr_logprob_after"],
+    #                 "psr_logprob_after": batch.batch["psr_logprob_after"],
 
-                    "rollout_logprobs": logprobs,
-                    "rollout_entropys": entropys,
+    #                 "rollout_logprobs": logprobs,
+    #                 "rollout_entropys": entropys,
 
-                    "old_log_probs": batch.batch["old_log_probs"],
-                    "response_masks": batch.batch["response_masks"],
-                    "responses": batch.batch["responses"],
+    #                 "old_log_probs": batch.batch["old_log_probs"],
+    #                 "response_masks": batch.batch["response_masks"],
+    #                 "responses": batch.batch["responses"],
 
-                    "grpo_current_entropys": batch.batch["grpo_current_entropys"],
-                    "nsr_current_entropys": batch.batch["nsr_current_entropys"],
-                    "psr_current_entropys": batch.batch["psr_current_entropys"],
+    #                 "grpo_current_entropys": batch.batch["grpo_current_entropys"],
+    #                 "nsr_current_entropys": batch.batch["nsr_current_entropys"],
+    #                 "psr_current_entropys": batch.batch["psr_current_entropys"],
 
-                    "score": batch.non_tensor_batch["score"]
-                }
-
-                dump_path = f"/home/ma-user/work/dev/_experiments/verl/_psrnsr/EXP44_128_64/playground/onpolicy-distill/{timestamp}/{i}.pt"
-                os.makedirs(os.path.dirname(dump_path), exist_ok=True)
-                torch.save(dump_data, dump_path)
+    #                 "score": batch.non_tensor_batch["score"]
+    #             }
 
 
             
-            print(f"[INFO] finish", flush=True)
-            # self._save_temp_checkpoint("/home/ma-user/work/dev/_experiments/verl/_psrnsr/EXP44_128_64/playground/step40_pie")
+    #         print(f"[INFO] finish", flush=True)
+    #         # self._save_temp_checkpoint("/home/ma-user/work/dev/_experiments/verl/_psrnsr/EXP44_128_64/playground/step40_pie")
 
 
 
 
-            # logprob_batch_key = ["input_ids", "attention_mask", "position_ids", "responses"]
-            # logprob_batch = batch.select(batch_keys=logprob_batch_key)
+    #         # logprob_batch_key = ["input_ids", "attention_mask", "position_ids", "responses"]
+    #         # logprob_batch = batch.select(batch_keys=logprob_batch_key)
 
-            # # recompute logprob after
-            # print(f"[INFO] start calculate logprobs", flush=True)
-            # logprob_after = self.actor_rollout_wg.compute_log_prob(logprob_batch)
-            # logprobs = logprob_after.batch['old_log_probs']
-            # entropys = logprob_after.batch['entropys']
-            # # logdiff = batch.batch['grpo_logprob_after'] - logprobs
+    #         # # recompute logprob after
+    #         # print(f"[INFO] start calculate logprobs", flush=True)
+    #         # logprob_after = self.actor_rollout_wg.compute_log_prob(logprob_batch)
+    #         # logprobs = logprob_after.batch['old_log_probs']
+    #         # entropys = logprob_after.batch['entropys']
+    #         # # logdiff = batch.batch['grpo_logprob_after'] - logprobs
 
-            # print(f"[INFO] end calculate logprobs", flush=True)
+    #         # print(f"[INFO] end calculate logprobs", flush=True)
 
-            # dump_data = {
-            #     "input_ids": batch.batch['input_ids'],
-            #     'attention_mask': batch.batch["attention_mask"],
+    #         # dump_data = {
+    #         #     "input_ids": batch.batch['input_ids'],
+    #         #     'attention_mask': batch.batch["attention_mask"],
 
-            #     "grpo_logprob_after": batch.batch["grpo_logprob_after"],
-            #     "nsr_logprob_after": batch.batch["nsr_logprob_after"],
-            #     "psr_logprob_after": batch.batch["psr_logprob_after"],
+    #         #     "grpo_logprob_after": batch.batch["grpo_logprob_after"],
+    #         #     "nsr_logprob_after": batch.batch["nsr_logprob_after"],
+    #         #     "psr_logprob_after": batch.batch["psr_logprob_after"],
 
-            #     "rollout_logprobs": logprobs,
-            #     "rollout_entropys": entropys,
+    #         #     "rollout_logprobs": logprobs,
+    #         #     "rollout_entropys": entropys,
 
 
-            #     "old_log_probs": batch.batch["old_log_probs"],
-            #     "response_masks": batch.batch["response_masks"],
-            #     "responses": batch.batch["responses"],
+    #         #     "old_log_probs": batch.batch["old_log_probs"],
+    #         #     "response_masks": batch.batch["response_masks"],
+    #         #     "responses": batch.batch["responses"],
 
-            #     "grpo_current_entropys": batch.batch["grpo_current_entropys"],
-            #     "nsr_current_entropys": batch.batch["nsr_current_entropys"],
-            #     "psr_current_entropys": batch.batch["psr_current_entropys"],
+    #         #     "grpo_current_entropys": batch.batch["grpo_current_entropys"],
+    #         #     "nsr_current_entropys": batch.batch["nsr_current_entropys"],
+    #         #     "psr_current_entropys": batch.batch["psr_current_entropys"],
 
-            #     "score": batch.non_tensor_batch["score"]
-            # }
+    #         #     "score": batch.non_tensor_batch["score"]
+    #         # }
 
-            # # import pdb; pdb.set_trace()
-            # dump_path = self.config.data.save_path
-            # torch.save(dump_data, dump_path)
-            # exit(-1)
+    #         # # import pdb; pdb.set_trace()
+    #         # dump_path = self.config.data.save_path
+    #         # torch.save(dump_data, dump_path)
+    #         # exit(-1)
