@@ -227,6 +227,48 @@ trainer:
   #  mode: "auto", "enable", or "disable"
   use_legacy_worker_impl: auto
 
+  # Token-level causal intervention experiment config
+  causal:
+
+    # Enable causal intervention flow in ray_trainer.fit
+    enable: False
+
+    # Path to sampled candidate .pt file
+    candidates_path: null
+
+    # Path to save causal intervention result .pt file
+    result_path: causal_results.pt
+
+    # Temporary checkpoint directory used for policy0 reset
+    tmp_ckpt_dir: causal_policy0_tmp
+
+    # Intervention strategies for each candidate token
+    strategies: ["random-n", "rollout-mask-token", "prompt-mask-token-adv", "batch-mask-token-adv"]
+
+    # Number of random valid response tokens to mask for random-n
+    random_n: 64
+
+    # Whether to keep the candidate token unmasked during update (True = candidate contributes gradient)
+    keep_candidate_grad: True
+
+    # Random seed for randomized intervention
+    seed: 42
+
+    # Optional cap on number of candidates for quick debugging
+    max_candidates: null
+
+    # Prefix length for prompt UID construction via input_ids[:, :prompt_len]
+    prompt_len: 8192
+
+    # Expected number of unique prompts in this batch
+    expected_prompt_num: 128
+
+    # Expected repeat count per prompt; null means use rollout.n
+    expected_repeat_per_prompt: null
+
+    # Temperature written into update batch meta_info
+    temperature: 1.0
+
 # profiler configs
 global_profiler:
 

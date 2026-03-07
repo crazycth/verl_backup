@@ -27,7 +27,7 @@ from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pprint import pprint
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import ray
@@ -274,6 +274,175 @@ def compute_advantage(
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
     return data
+
+
+def _as_numpy_1d(name: str, value: Any) -> np.ndarray:
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().numpy()
+    elif isinstance(value, list | tuple):
+        value = np.asarray(value)
+    elif not isinstance(value, np.ndarray):
+        value = np.asarray(value)
+
+    if value.ndim != 1:
+        value = value.reshape(-1)
+    return value
+
+
+def load_causal_candidates(candidates_path: str) -> dict[str, np.ndarray]:
+    if not os.path.exists(candidates_path):
+        raise FileNotFoundError(f"Candidates file not found: {candidates_path}")
+
+    payload = torch.load(candidates_path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Candidates file must be a dict, got {type(payload)}")
+
+    if "candidates" in payload:
+        candidates = payload["candidates"]
+    else:
+        candidates = payload
+
+    if not isinstance(candidates, dict):
+        raise ValueError(f"`candidates` must be a dict, got {type(candidates)}")
+
+    required_keys = ["row_idx", "col_idx", "token_id"]
+    for key in required_keys:
+        if key not in candidates:
+            raise KeyError(f"Missing candidate key `{key}` in {candidates_path}")
+
+    normalized: dict[str, np.ndarray] = {}
+    for key, value in candidates.items():
+        normalized[key] = _as_numpy_1d(key, value)
+
+    n = normalized["row_idx"].shape[0]
+    for key in required_keys:
+        if normalized[key].shape[0] != n:
+            raise ValueError(
+                f"Candidates length mismatch: `{key}` has {normalized[key].shape[0]}, expected {n}"
+            )
+
+    normalized["row_idx"] = normalized["row_idx"].astype(np.int64)
+    normalized["col_idx"] = normalized["col_idx"].astype(np.int64)
+    normalized["token_id"] = normalized["token_id"].astype(np.int64)
+    if "prompt_uid" in normalized:
+        normalized["prompt_uid"] = normalized["prompt_uid"].astype(np.int64)
+    return normalized
+
+
+def build_prompt_uid(
+    input_ids: torch.Tensor,
+    *,
+    prompt_len: int = 8192,
+    expected_prompt_num: Optional[int] = 128,
+    expected_repeat_per_prompt: Optional[int] = None,
+) -> torch.Tensor:
+    prompt = input_ids[:, :prompt_len]
+    _, inverse, counts = torch.unique(prompt, dim=0, return_inverse=True, return_counts=True)
+
+    unique_prompt_num = int(counts.shape[0])
+    if expected_prompt_num is not None:
+        assert unique_prompt_num == int(expected_prompt_num), (
+            f"Expected {expected_prompt_num} unique prompts from input_ids[:, :{prompt_len}], "
+            f"but got {unique_prompt_num}"
+        )
+
+    if expected_repeat_per_prompt is not None:
+        expected_repeat_per_prompt = int(expected_repeat_per_prompt)
+        if not torch.all(counts == expected_repeat_per_prompt):
+            min_repeat = int(counts.min().item())
+            max_repeat = int(counts.max().item())
+            raise AssertionError(
+                f"Expected each prompt repeats {expected_repeat_per_prompt} times, "
+                f"but got min={min_repeat}, max={max_repeat}"
+            )
+    return inverse
+
+
+def get_response_mask(
+    strategy: str,
+    base_response_mask: torch.Tensor,
+    responses: torch.Tensor,
+    row_idx: int,
+    col_idx: int,
+    token_id: int,
+    *,
+    random_n: int = 0,
+    rng: Optional[torch.Generator] = None,
+    prompt_uid: Optional[torch.Tensor] = None,
+    adv_sign: Optional[torch.Tensor] = None,
+    keep_candidate_grad: bool = True,
+) -> torch.Tensor:
+    if not (0 <= row_idx < responses.shape[0]) or not (0 <= col_idx < responses.shape[1]):
+        raise IndexError(
+            f"Candidate index out of range: row_idx={row_idx}, col_idx={col_idx}, "
+            f"shape={tuple(responses.shape)}"
+        )
+
+    observed_token = int(responses[row_idx, col_idx].item())
+    if observed_token != int(token_id):
+        raise AssertionError(
+            f"Candidate token mismatch at (row={row_idx}, col={col_idx}): "
+            f"expected token_id={token_id}, found={observed_token}"
+        )
+
+    valid_mask = base_response_mask > 0
+    if not bool(valid_mask[row_idx, col_idx].item()):
+        raise AssertionError(
+            f"Candidate token must satisfy response_mask==1, but got 0 at (row={row_idx}, col={col_idx})"
+        )
+
+    new_mask = valid_mask.clone()
+    strategy = str(strategy).lower()
+
+    if strategy == "random-n":
+        random_n = int(random_n)
+        if random_n > 0:
+            candidates = valid_mask.clone()
+            candidates[row_idx, col_idx] = False
+            valid_pos = candidates.nonzero(as_tuple=False)
+            pick_n = min(random_n, int(valid_pos.shape[0]))
+            if pick_n > 0:
+                perm = torch.randperm(valid_pos.shape[0], generator=rng, device=valid_pos.device)[:pick_n]
+                picked = valid_pos.index_select(0, perm)
+                new_mask[picked[:, 0], picked[:, 1]] = False
+
+    elif strategy == "rollout-mask-token":
+        cond = valid_mask[row_idx] & (responses[row_idx] == int(token_id))
+        new_mask[row_idx, cond] = False
+
+    elif strategy in ("prompt-mask-token-adv", "batch-mask-token-adv"):
+        if adv_sign is None:
+            raise ValueError(f"`adv_sign` is required for strategy `{strategy}`")
+
+        anchor_sign = adv_sign[row_idx, col_idx]
+        token_cond = responses == int(token_id)
+        sign_cond = adv_sign == anchor_sign
+        cond = valid_mask & token_cond & sign_cond
+
+        if strategy == "prompt-mask-token-adv":
+            if prompt_uid is None:
+                raise ValueError("`prompt_uid` is required for `prompt-mask-token-adv`")
+            if prompt_uid.ndim != 1 or prompt_uid.shape[0] != responses.shape[0]:
+                raise ValueError(
+                    f"`prompt_uid` shape must be [batch], got {tuple(prompt_uid.shape)} "
+                    f"for batch={responses.shape[0]}"
+                )
+            group_mask = prompt_uid == prompt_uid[row_idx]
+            cond = cond & group_mask.unsqueeze(1)
+
+        new_mask[cond] = False
+
+    else:
+        raise ValueError(
+            f"Unsupported strategy `{strategy}`. "
+            f"Supported: random-n, rollout-mask-token, prompt-mask-token-adv, batch-mask-token-adv"
+        )
+
+    if keep_candidate_grad:
+        new_mask[row_idx, col_idx] = True
+    else:
+        new_mask[row_idx, col_idx] = False
+    return new_mask.to(dtype=base_response_mask.dtype)
 
 
 class RayPPOTrainer:
@@ -645,10 +814,12 @@ class RayPPOTrainer:
     def _save_temp_checkpoint(self, folder_name):
         import shutil
         import os
-        import torch
         from verl.utils.fs import local_mkdir_safe
 
-        local_folder = os.path.join(self.config.trainer.default_local_dir, folder_name)
+        if os.path.isabs(folder_name):
+            local_folder = folder_name
+        else:
+            local_folder = os.path.join(self.config.trainer.default_local_dir, folder_name)
         print(f"[INFO][_save_temp_checkpoint] Saving temp checkpoint to {local_folder}", flush=True)
 
         if os.path.exists(local_folder):
@@ -672,17 +843,22 @@ class RayPPOTrainer:
     def _load_temp_checkpoint(self, folder_name):
         import os
 
-        if not os.path.exists(folder_name):
-            raise FileNotFoundError(f"Temporary checkpoint not found at: {folder_name}")
-        
-        actor_path = os.path.join(folder_name, "actor")
+        if os.path.isabs(folder_name):
+            local_folder = folder_name
+        else:
+            local_folder = os.path.join(self.config.trainer.default_local_dir, folder_name)
+
+        if not os.path.exists(local_folder):
+            raise FileNotFoundError(f"Temporary checkpoint not found at: {local_folder}")
+
+        actor_path = os.path.join(local_folder, "actor")
 
         self.actor_rollout_wg.load_checkpoint(
             actor_path,
             del_local_after_load=False
         )
 
-        print(f"[INFO][_load_temp_checkpoint] Successfully Loaded temp checkpoint from {folder_name}", flush=True)
+        print(f"[INFO][_load_temp_checkpoint] Successfully Loaded temp checkpoint from {local_folder}", flush=True)
 
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":
@@ -822,32 +998,359 @@ class RayPPOTrainer:
 
         # Return unchanged batch and empty metrics if IS is disabled
         return batch, {}
+    
 
-        def _save_temp_checkpoint(self, folder_name):
-            import shutil
-            import os
-            import torch
-            from verl.utils.fs import local_mkdir_safe
+    def _write_results_append(self, result):
+        import os, json
+        path = self.config.trainer.causal.result_path
+        with open(path, "a") as f:
+            f.write(json.dumps(result) + "\n")
+        print(f"[INFO][causal] wrote result to {path}", flush=True)
 
-            local_folder = os.path.join(self.config.trainer.default_local_dir, folder_name)
-            print(f"[INFO][_save_temp_checkpoint] Saving temp checkpoint to {local_folder}", flush=True)
 
-            if os.path.exists(local_folder):
-                print(f"[INFO][_save_temp_checkpoint] Target folder exists, Removing: {local_folder}", flush=True)
-                shutil.rmtree(local_folder)
+    def fit(self):
+        from omegaconf import OmegaConf
 
-            local_mkdir_safe(local_folder)
+        from verl.utils.tracking import Tracking
 
-            actor_local_path = os.path.join(local_folder, "actor")
-            self.actor_rollout_wg.save_checkpoint(
-                actor_local_path, 
-                None,
-                self.global_steps,
-                max_ckpt_to_keep=None
+        Tracking(
+            project_name=self.config.trainer.project_name,
+            experiment_name=self.config.trainer.experiment_name,
+            default_backend=self.config.trainer.logger,
+            config=OmegaConf.to_container(self.config, resolve=True),
+        )
+
+        self.global_steps = 0
+        self._load_checkpoint()
+        self.global_steps += 1
+
+        causal_cfg = self.config.trainer.get("causal", {})
+        if not causal_cfg.get("enable", False):
+            print("[INFO][causal] trainer.causal.enable=False, skip causal intervention run.", flush=True)
+            return
+
+        candidates_path = causal_cfg.get("candidates_path", None)
+        if candidates_path is None:
+            raise ValueError("trainer.causal.candidates_path is required when trainer.causal.enable=True")
+        if not os.path.isabs(candidates_path):
+            candidates_path = os.path.join(os.getcwd(), candidates_path)
+
+        result_path = causal_cfg.get("result_path", None)
+        if result_path is None:
+            result_path = os.path.join(self.config.trainer.default_local_dir, "causal_results.pt")
+        if not os.path.isabs(result_path):
+            result_path = os.path.join(os.getcwd(), result_path)
+
+        random_n = int(causal_cfg.get("random_n", 64))
+        prompt_len = int(causal_cfg.get("prompt_len", 8192))
+        expected_prompt_num = causal_cfg.get("expected_prompt_num", 128)
+        expected_prompt_num = None if expected_prompt_num is None else int(expected_prompt_num)
+
+        print(f"[INFO][causal] expected_prompt_num: {expected_prompt_num}, prompt_len: {prompt_len}", flush=True)
+
+        expected_repeat = causal_cfg.get("expected_repeat_per_prompt", None)
+        if expected_repeat is None:
+            expected_repeat = self.config.actor_rollout_ref.rollout.get("n", None)
+        expected_repeat = None if expected_repeat is None else int(expected_repeat)
+
+        strategies = causal_cfg.get(
+            "strategies",
+            ["random-n", "rollout-mask-token", "prompt-mask-token-adv", "batch-mask-token-adv"],
+        )
+        if isinstance(strategies, str):
+            strategies = [strategies]
+        strategies = [str(s).lower() for s in strategies]
+
+        max_candidates = causal_cfg.get("max_candidates", None)
+        max_candidates = None if max_candidates is None else int(max_candidates)
+
+        seed = int(causal_cfg.get("seed", 42))
+        keep_candidate_grad = bool(causal_cfg.get("keep_candidate_grad", True))
+
+        tmp_ckpt_dir = causal_cfg.get("tmp_ckpt_dir", f"causal_policy0_step_{self.global_steps}")
+
+        train_iter = iter(self.train_dataloader)
+        try:
+            batch_dict = next(train_iter)
+        except StopIteration as exc:
+            raise ValueError("Train dataloader is empty, cannot run causal intervention.") from exc
+
+        normalized_batch_dict = {}
+        for key, value in batch_dict.items():
+            if hasattr(value, "shape") and value.shape[0] == 1:
+                normalized_batch_dict[key] = value[0]
+            elif isinstance(value, list) and len(value) == 1:
+                normalized_batch_dict[key] = value[0]
+            else:
+                normalized_batch_dict[key] = value
+
+        batch: DataProto = DataProto.from_single_dict(normalized_batch_dict)
+        if "response_mask" not in batch.batch:
+            if "response_masks" in batch.batch:
+                batch.batch["response_mask"] = batch.batch["response_masks"]
+            else:
+                batch.batch["response_mask"] = compute_response_mask(batch)
+
+        responses = batch.batch["responses"]
+        base_response_mask = batch.batch["response_mask"]
+        rng = torch.Generator(device=responses.device.type)
+        rng.manual_seed(seed)
+        prompt_uid = build_prompt_uid(
+            batch.batch["input_ids"],
+            prompt_len=prompt_len,
+            expected_prompt_num=expected_prompt_num,
+            expected_repeat_per_prompt=expected_repeat,
+        )
+        batch.non_tensor_batch["uid"] = prompt_uid.cpu().numpy().astype(np.int64)
+
+        print(f"[INFO][causal] load candidates from {candidates_path}", flush=True)
+        candidates = load_causal_candidates(candidates_path)
+        total_candidates = int(candidates["row_idx"].shape[0])
+        print(f"[INFO][causal] total_candidates: {total_candidates}", flush=True)
+
+        if max_candidates is not None:
+            total_candidates = min(total_candidates, max_candidates)
+            for key in list(candidates.keys()):
+                candidates[key] = candidates[key][:total_candidates]
+
+        row_idx = candidates["row_idx"]
+        col_idx = candidates["col_idx"]
+        token_id = candidates["token_id"]
+
+        if total_candidates == 0:
+            print("[INFO][causal] No candidates found, skip intervention and save empty results.", flush=True)
+            result_dir = os.path.dirname(result_path)
+            if result_dir:
+                os.makedirs(result_dir, exist_ok=True)
+            output_payload = {
+                "schema_version": "causal_intervention_result_v1",
+                "candidates_path": candidates_path,
+                "result_count": 0,
+                "seed": seed,
+                "random_n": random_n,
+                "strategies": ["baseline"] + strategies,
+                "update_api": "update_actor",
+                "results": [],
+            }
+            torch.save(output_payload, result_path)
+            print(f"[INFO][causal] saved empty results to {result_path}", flush=True)
+            return
+
+        batch_size, response_len = responses.shape
+        if np.any((row_idx < 0) | (row_idx >= batch_size)):
+            raise IndexError(f"Candidate row_idx out of range [0, {batch_size}): {row_idx}")
+        if np.any((col_idx < 0) | (col_idx >= response_len)):
+            raise IndexError(f"Candidate col_idx out of range [0, {response_len}): {col_idx}")
+
+        row_idx_t = torch.from_numpy(row_idx).to(device=responses.device, dtype=torch.long)
+        col_idx_t = torch.from_numpy(col_idx).to(device=responses.device, dtype=torch.long)
+        token_observed = responses[row_idx_t, col_idx_t].detach().cpu().numpy().astype(np.int64)
+        mismatch_idx = np.where(token_observed != token_id)[0]
+        if mismatch_idx.size > 0:
+            i = int(mismatch_idx[0])
+            raise AssertionError(
+                f"Candidate token mismatch at index {i}: "
+                f"(row={int(row_idx[i])}, col={int(col_idx[i])}) "
+                f"expected={int(token_id[i])}, observed={int(token_observed[i])}"
             )
 
-            print(f"[INFO][_save_temp_checkpoint] Successfully Saved temp checkpoint to {local_folder}", flush=True)
-        
+        if "prompt_uid" in candidates:
+            prompt_uid_np = prompt_uid.detach().cpu().numpy().astype(np.int64)
+            cand_prompt_uid = candidates["prompt_uid"].astype(np.int64)
+            prompt_uid_mismatch = np.where(cand_prompt_uid != prompt_uid_np[row_idx])[0]
+            if prompt_uid_mismatch.size > 0:
+                i = int(prompt_uid_mismatch[0])
+                raise AssertionError(
+                    f"Candidate prompt_uid mismatch at index {i}: "
+                    f"candidate={int(cand_prompt_uid[i])}, recomputed={int(prompt_uid_np[row_idx[i]])}"
+                )
+
+        print(f"[INFO][causal] compute policy0 logprob", flush=True)
+        logprob_batch = batch.select(batch_keys=["input_ids", "attention_mask", "position_ids", "responses"])
+        policy0_logprob = self.actor_rollout_wg.compute_log_prob(logprob_batch).batch["old_log_probs"].detach().clone()
+
+        base_batch = deepcopy(batch)
+        # import pdb; pdb.set_trace()
+        # base_batch.batch["old_log_probs"] = policy0_logprob.clone()
+
+        # Build sparse token-level rewards from scalar outcome score, same as old commented flow:
+        # only the last valid response token receives row-level score.
+        if "token_level_rewards" not in base_batch.batch:
+            if "score" not in base_batch.non_tensor_batch:
+                raise KeyError(
+                    "Current causal GRPO flow requires non_tensor_batch['score'] to build token-level rewards."
+                )
+
+            response_mask = base_batch.batch["response_mask"]
+            scores_np = _as_numpy_1d("score", base_batch.non_tensor_batch["score"]).astype(np.float32, copy=False)
+            if scores_np.shape[0] != response_mask.shape[0]:
+                raise ValueError(
+                    f"Score length mismatch: score_len={scores_np.shape[0]}, batch_size={response_mask.shape[0]}"
+                )
+
+            scores = torch.as_tensor(scores_np, dtype=torch.float32, device=response_mask.device)
+            batch_size_local = scores.shape[0]
+            response_len_local = base_batch.batch["responses"].shape[1]
+
+            token_level_scores = torch.zeros(
+                (batch_size_local, response_len_local), dtype=scores.dtype, device=scores.device
+            )
+            seq_lengths = response_mask.sum(dim=1).long()
+            last_token_indices = (seq_lengths - 1).clamp(min=0)
+            token_level_scores[torch.arange(batch_size_local, device=scores.device), last_token_indices] = scores
+            token_level_scores = token_level_scores * response_mask
+
+            base_batch.batch["token_level_scores"] = token_level_scores
+            base_batch.batch["token_level_rewards"] = token_level_scores
+
+        norm_adv_by_std_in_grpo = bool(self.config.algorithm.get("norm_adv_by_std_in_grpo", True))
+        print(f"[INFO][causal] compute advantage with GRPO, norm_adv_by_std_in_grpo={norm_adv_by_std_in_grpo}, gamma: {self.config.algorithm.gamma}, lam: {self.config.algorithm.lam}, rollout_n: {self.config.actor_rollout_ref.rollout.n}", flush=True)
+        base_batch = compute_advantage(
+            base_batch,
+            adv_estimator=AdvantageEstimator.GRPO,
+            gamma=self.config.algorithm.gamma,
+            lam=self.config.algorithm.lam,
+            num_repeat=self.config.actor_rollout_ref.rollout.n,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            config=self.config.algorithm,
+        )
+
+        need_adv_sign = any(s in ("prompt-mask-token-adv", "batch-mask-token-adv") for s in strategies)
+        adv_sign = None
+        if need_adv_sign:
+            if "advantages" not in base_batch.batch:
+                raise KeyError("Missing `advantages` after GRPO compute_advantage.")
+            adv_sign = torch.sign(base_batch.batch["advantages"].float())
+            adv_sign = torch.where(adv_sign == 0, torch.ones_like(adv_sign), adv_sign)
+        prompt_uid_t = prompt_uid.to(responses.device)
+
+        print(
+            f"[INFO][causal] start intervention: candidates={total_candidates}, "
+            f"strategies={strategies}, keep_candidate_grad={keep_candidate_grad}, update_api=update_actor",
+            flush=True,
+        )
+
+        self._save_temp_checkpoint(folder_name=tmp_ckpt_dir)
+
+        results: list[dict[str, Any]] = []
+        all_modes = ["baseline"] + strategies
+        full_valid_tokens = int((base_response_mask > 0).sum().item())
+
+        def _to_scalar(value: Any) -> Any:
+            if isinstance(value, np.generic):
+                return value.item()
+            if torch.is_tensor(value):
+                if value.numel() == 1:
+                    return value.item()
+                return value.detach().cpu().tolist()
+            return value
+
+        def _single_step_update(mask_for_update: torch.Tensor) -> dict[str, Any]:
+            update_batch = deepcopy(base_batch)
+            update_batch.batch["response_mask"] = mask_for_update.to(dtype=base_response_mask.dtype)
+            update_batch.meta_info["temperature"] = float(causal_cfg.get("temperature", 1.0))
+            update_batch.meta_info["global_token_num"] = torch.sum(update_batch.batch["attention_mask"], dim=-1).tolist()
+
+            update_output = self.actor_rollout_wg.update_actor(update_batch)
+
+            update_metrics: dict[str, Any] = {}
+            if isinstance(update_output, DataProto):
+                metric_dict = update_output.meta_info.get("metrics", {})
+                if isinstance(metric_dict, dict):
+                    metric_dict = reduce_metrics(metric_dict)
+                    update_metrics = {k: _to_scalar(v) for k, v in metric_dict.items()}
+            return update_metrics
+
+        from tqdm import tqdm
+        for cand_idx in tqdm(range(total_candidates)):
+            r = int(row_idx[cand_idx])
+            c = int(col_idx[cand_idx])
+            tok = int(token_id[cand_idx])
+            prompt_id = int(prompt_uid_t[r].item())
+            lp0 = float(policy0_logprob[r, c].item())
+
+            candidate_meta = {}
+            for key, arr in candidates.items():
+                candidate_meta[key] = _to_scalar(arr[cand_idx])
+
+            for mode in all_modes:
+                if mode == "baseline":
+                    intervention_mask = base_response_mask.clone()
+                else:
+                    intervention_mask = get_response_mask(
+                        strategy=mode,
+                        base_response_mask=base_response_mask,
+                        responses=responses,
+                        row_idx=r,
+                        col_idx=c,
+                        token_id=tok,
+                        random_n=random_n,
+                        rng=rng,
+                        prompt_uid=prompt_uid_t,
+                        adv_sign=adv_sign,
+                        keep_candidate_grad=keep_candidate_grad,
+                    )
+
+                kept_tokens = int((intervention_mask > 0).sum().item())
+                masked_tokens = full_valid_tokens - kept_tokens
+
+                self._load_temp_checkpoint(folder_name=tmp_ckpt_dir)
+                update_metrics = _single_step_update(intervention_mask)
+                updated_logprob = self.actor_rollout_wg.compute_log_prob(logprob_batch).batch["old_log_probs"]
+                lp_after = float(updated_logprob[r, c].item())
+                delta = lp_after - lp0
+                token_adv = base_batch.batch['advantages'][r, c].item()
+
+                result = {
+                    "candidate_index": cand_idx,
+                    "strategy": mode,
+                    "keep_candidate_grad": keep_candidate_grad,
+                    # "update_api": "update_actor",
+                    "row_idx": r,
+                    "col_idx": c,
+                    "token_id": tok,
+                    "token_adv": token_adv,
+
+                    "prompt_uid": prompt_id,
+                    "policy0_logprob": lp0,
+                    "policy_after_logprob": lp_after,
+                    "delta_logprob": delta,
+                    "masked_token_num": masked_tokens,
+                    "kept_token_num": kept_tokens,
+                    "candidate_meta": candidate_meta,
+                    # "update_metrics": update_metrics,
+                }
+                results.append(result)
+
+                # save everyturn to file
+                self._write_results_append(result)
+
+                print(
+                    f"[CAUSAL] cand={cand_idx:04d} mode={mode:<24} "
+                    f"(r={r}, c={c}, tok={tok}) lp0={lp0:.6f} lp={lp_after:.6f} d={delta:+.6f} adv={token_adv:+.6f} "
+                    f"masked={masked_tokens}",
+                    flush=True,
+                )
+
+        self._load_temp_checkpoint(folder_name=tmp_ckpt_dir)
+
+        result_dir = os.path.dirname(result_path)
+        if result_dir:
+            os.makedirs(result_dir, exist_ok=True)
+        output_payload = {
+            "schema_version": "causal_intervention_result_v1",
+            "candidates_path": candidates_path,
+            "result_count": len(results),
+            "seed": seed,
+            "random_n": random_n,
+            "strategies": all_modes,
+            "update_api": "update_actor",
+            "results": results,
+        }
+        torch.save(output_payload, result_path)
+        print(f"[INFO][causal] saved results to {result_path}, count={len(results)}", flush=True)
+        return
+
 
 
     # def fit(self):
@@ -869,7 +1372,6 @@ class RayPPOTrainer:
     #     )
 
     #     self.global_steps = 0
-    #     # import pdb; pdb.set_trace()
 
     #     # load checkpoint before doing anything
     #     self._load_checkpoint()
@@ -894,330 +1396,245 @@ class RayPPOTrainer:
 
     #         # import pdb; pdb.set_trace()
 
-    #         logprob_batch_key = ["input_ids", "attention_mask", "position_ids", "responses"]
-    #         logprob_batch = batch.select(batch_keys=logprob_batch_key)
-
-    #         # recompute logprob after
-    #         print(f"[INFO] start calculate logprobs", flush=True)
-    #         logprob_after = self.actor_rollout_wg.compute_log_prob(logprob_batch)
-    #         logprobs = logprob_after.batch['old_log_probs']
-    #         entropys = logprob_after.batch['entropys']
-    #         # logdiff = batch.batch['grpo_logprob_after'] - logprobs
-
-    #         print(f"[INFO] end calculate logprobs", flush=True)
-
-    #         dump_data = {
-    #             "input_ids": batch.batch['input_ids'],
-    #             'attention_mask': batch.batch["attention_mask"],
-
-    #             "grpo_logprob_after": batch.batch["grpo_logprob_after"],
-    #             "nsr_logprob_after": batch.batch["nsr_logprob_after"],
-    #             "psr_logprob_after": batch.batch["psr_logprob_after"],
-
-    #             "rollout_logprobs": logprobs,
-    #             "rollout_entropys": entropys,
-
-
-    #             "old_log_probs": batch.batch["old_log_probs"],
-    #             "response_masks": batch.batch["response_masks"],
-    #             "responses": batch.batch["responses"],
-
-    #             "grpo_current_entropys": batch.batch["grpo_current_entropys"],
-    #             "nsr_current_entropys": batch.batch["nsr_current_entropys"],
-    #             "psr_current_entropys": batch.batch["psr_current_entropys"],
-
-    #             "score": batch.non_tensor_batch["score"]
-    #         }
+    #         # ------------------------------------------------------------------
+    #         # 从标量 outcome score 构造逐 token 的 reward / score
+    #         # 说明：
+    #         # - 当前批次的任务级得分存放在 batch.non_tensor_batch["score"]，形如 (batch_size,)
+    #         # - 我们希望为每个 response token 构造同一个标量 reward，并用 response_mask 做掩码
+    #         # - 目前没有任何 KL 项，因此 token_level_rewards 与 token_level_scores 相同
+    #         # ------------------------------------------------------------------
+    #         # ------------------------------------------------------------------
+    #         # 修改版：从标量 outcome score 构造 Sparse Reward (仅最后一个 token 有分)
+    #         # ------------------------------------------------------------------
 
     #         # import pdb; pdb.set_trace()
-    #         dump_path = self.config.data.save_path
-    #         torch.save(dump_data, dump_path)
-    #         exit(-1)
-
-
-
-    def fit(self):
-        """
-        The training loop of PPO.
-        The driver process only need to call the compute functions of the worker group through RPC
-        to construct the PPO dataflow.
-        The light-weight advantage computation is done on the driver process.
-        """
-        from omegaconf import OmegaConf
-
-        from verl.utils.tracking import Tracking
-
-        logger = Tracking(
-            project_name=self.config.trainer.project_name,
-            experiment_name=self.config.trainer.experiment_name,
-            default_backend=self.config.trainer.logger,
-            config=OmegaConf.to_container(self.config, resolve=True),
-        )
-
-        self.global_steps = 0
-
-        # load checkpoint before doing anything
-        self._load_checkpoint()
-
-        # we start from step 1
-        self.global_steps += 1
-
-        for batch_dict in self.train_dataloader:
-            metrics = {}
-            timing_raw = {}
-
-            new_batch_dict = {}
-            for k,v in batch_dict.items():
-                if hasattr(v, 'shape') and v.shape[0] == 1:
-                    new_batch_dict[k] = v[0]
-                elif isinstance(v, list) and len(v) == 1:
-                    new_batch_dict[k] = v[0]
-                else:
-                    new_batch_dict[k] = v
-
-            batch: DataProto = DataProto.from_single_dict(new_batch_dict)
-
-            # import pdb; pdb.set_trace()
-
-            # ------------------------------------------------------------------
-            # 从标量 outcome score 构造逐 token 的 reward / score
-            # 说明：
-            # - 当前批次的任务级得分存放在 batch.non_tensor_batch["score"]，形如 (batch_size,)
-            # - 我们希望为每个 response token 构造同一个标量 reward，并用 response_mask 做掩码
-            # - 目前没有任何 KL 项，因此 token_level_rewards 与 token_level_scores 相同
-            # ------------------------------------------------------------------
-            # ------------------------------------------------------------------
-            # 修改版：从标量 outcome score 构造 Sparse Reward (仅最后一个 token 有分)
-            # ------------------------------------------------------------------
-
-            # import pdb; pdb.set_trace()
             
-            # 1) 取出标量得分
-            scores_np = batch.non_tensor_batch["score"]  # (B,)
-            scores = torch.as_tensor(
-                scores_np,
-                dtype=torch.float32,
-                device=batch.batch["responses"].device,
-            )  # (B,)
+    #         # 1) 取出标量得分
+    #         scores_np = batch.non_tensor_batch["score"]  # (B,)
+    #         scores = torch.as_tensor(
+    #             scores_np,
+    #             dtype=torch.float32,
+    #             device=batch.batch["responses"].device,
+    #         )  # (B,)
 
-            # 2) 【关键修改】必须先获取 response_mask，因为我们需要用它来确定“哪里是最后一个位置”
-            if "response_masks" in batch.batch:
-                response_mask = batch.batch["response_masks"]
+    #         # 2) 【关键修改】必须先获取 response_mask，因为我们需要用它来确定“哪里是最后一个位置”
+    #         if "response_masks" in batch.batch:
+    #             response_mask = batch.batch["response_masks"]
 
-            # 3) 初始化全 0 的 token_level_scores
-            response_length = batch.batch["responses"].size(1)
-            batch_size = scores.size(0)
-            token_level_scores = torch.zeros(
-                (batch_size, response_length), 
-                dtype=scores.dtype, 
-                device=scores.device
-            )
+    #         # 3) 初始化全 0 的 token_level_scores
+    #         response_length = batch.batch["responses"].size(1)
+    #         batch_size = scores.size(0)
+    #         token_level_scores = torch.zeros(
+    #             (batch_size, response_length), 
+    #             dtype=scores.dtype, 
+    #             device=scores.device
+    #         )
 
-            # 4) 计算每个样本最后一个有效 token 的索引
-            #    假设 mask 是 [1, 1, 1, 0, 0]，sum 是 3，最后一个有效索引是 2 (即 3-1)
-            #    注意：要确保 response_mask 类型是数值型以便求和
-            seq_lengths = response_mask.sum(dim=1).long() 
-            last_token_indices = seq_lengths - 1
+    #         # 4) 计算每个样本最后一个有效 token 的索引
+    #         #    假设 mask 是 [1, 1, 1, 0, 0]，sum 是 3，最后一个有效索引是 2 (即 3-1)
+    #         #    注意：要确保 response_mask 类型是数值型以便求和
+    #         seq_lengths = response_mask.sum(dim=1).long() 
+    #         last_token_indices = seq_lengths - 1
 
-            # 5) 【核心修改】只给最后一个有效位置赋值
-            #    利用高级索引：token_level_scores[行索引, 列索引] = scores
-            #    为了防止全是 padding 的空行导致索引 -1 (虽然极少见)，可以加个 clamp 或断言
-            last_token_indices = last_token_indices.clamp(min=0) 
+    #         # 5) 【核心修改】只给最后一个有效位置赋值
+    #         #    利用高级索引：token_level_scores[行索引, 列索引] = scores
+    #         #    为了防止全是 padding 的空行导致索引 -1 (虽然极少见)，可以加个 clamp 或断言
+    #         last_token_indices = last_token_indices.clamp(min=0) 
             
-            token_level_scores[torch.arange(batch_size, device=scores.device), last_token_indices] = scores
+    #         token_level_scores[torch.arange(batch_size, device=scores.device), last_token_indices] = scores
 
-            # 6) 再次应用 mask (双重保险，确保 padding 位置绝对是 0)
-            token_level_scores = token_level_scores * response_mask
+    #         # 6) 再次应用 mask (双重保险，确保 padding 位置绝对是 0)
+    #         token_level_scores = token_level_scores * response_mask
 
-            # 7) 写回 batch
-            batch.batch["token_level_scores"] = token_level_scores
-            batch.batch["token_level_rewards"] = token_level_scores
+    #         # 7) 写回 batch
+    #         batch.batch["token_level_scores"] = token_level_scores
+    #         batch.batch["token_level_rewards"] = token_level_scores
 
-            # batch.batch["input_ids"] shape: (1024, 16384) -> prefix: (1024, 8192)
-            prefix_len = 8192
-            prompt_prefix = batch.batch["input_ids"][:, :prefix_len]
+    #         # batch.batch["input_ids"] shape: (1024, 16384) -> prefix: (1024, 8192)
+    #         prefix_len = 8192
+    #         prompt_prefix = batch.batch["input_ids"][:, :prefix_len]
 
-            # 2. 使用 torch.unique 按行去重
-            # return_inverse=True 会返回一个索引 tensor，指示原 tensor 中每一行对应 unique 结果中的哪个下标
-            # 这些下标 (0, 1, 2...) 天然就是我们要的组 ID
-            _, uid_indices = torch.unique(prompt_prefix, return_inverse=True, dim=0)
+    #         # 2. 使用 torch.unique 按行去重
+    #         # return_inverse=True 会返回一个索引 tensor，指示原 tensor 中每一行对应 unique 结果中的哪个下标
+    #         # 这些下标 (0, 1, 2...) 天然就是我们要的组 ID
+    #         _, uid_indices = torch.unique(prompt_prefix, return_inverse=True, dim=0)
 
-            # 3. Assert 检查：确认去重后的数量正好是 128
-            num_unique_uids = uid_indices.max().item() + 1
-            expected_repeat = self.config.actor_rollout_ref.rollout.n
-            batch_size = uid_indices.numel()
-            assert batch_size % expected_repeat == 0, (
-                f"Assertion Failed: batch_size={batch_size} is not divisible by rollout.n={expected_repeat}."
-            )
-            expected_prompt_num = batch_size // expected_repeat
-            assert num_unique_uids == expected_prompt_num, (
-                f"Assertion Failed: Expected {expected_prompt_num} unique UIDs based on first {prefix_len} tokens, "
-                f"but found {num_unique_uids}. Please check your batch composition."
-            )
+    #         # 3. Assert 检查：确认去重后的数量正好是 128
+    #         num_unique_uids = uid_indices.max().item() + 1
+    #         expected_repeat = self.config.actor_rollout_ref.rollout.n
+    #         batch_size = uid_indices.numel()
+    #         assert batch_size % expected_repeat == 0, (
+    #             f"Assertion Failed: batch_size={batch_size} is not divisible by rollout.n={expected_repeat}."
+    #         )
+    #         expected_prompt_num = batch_size // expected_repeat
+    #         assert num_unique_uids == expected_prompt_num, (
+    #             f"Assertion Failed: Expected {expected_prompt_num} unique UIDs based on first {prefix_len} tokens, "
+    #             f"but found {num_unique_uids}. Please check your batch composition."
+    #         )
 
-            # 3.1 如果设置了 tune_bs，则只保留前 tune_bs 个 prompt 及其全部 rollouts
-            # import pdb; pdb.set_trace()
-            batch_for_logprob = copy.deepcopy(batch)
-            tune_bs = self.config.data.get("tune_bs", None)
-            print(f"[INFO] tune_bs: {tune_bs}, expected_prompt_num: {expected_prompt_num}", flush=True)
-            if tune_bs is not None:
-                tune_bs = int(tune_bs)
-                assert tune_bs > 0, f"tune_bs must be > 0, got {tune_bs}."
-                assert tune_bs <= expected_prompt_num, (
-                    f"tune_bs must be <= {expected_prompt_num}, got {tune_bs}."
-                )
-                if tune_bs < expected_prompt_num:
-                    # 按首次出现顺序选取 prompt UID
-                    uid_indices_cpu = uid_indices.detach().cpu()
-                    uid_indices_np = uid_indices_cpu.numpy()
-                    first_pos = np.full((num_unique_uids,), batch_size, dtype=np.int64)
-                    for idx, uid in enumerate(uid_indices_np):
-                        if idx < first_pos[uid]:
-                            first_pos[uid] = idx
-                    ordered_uids = np.argsort(first_pos)
-                    uids_to_keep_np = ordered_uids[:tune_bs]
+    #         # 3.1 如果设置了 tune_bs，则只保留前 tune_bs 个 prompt 及其全部 rollouts
+    #         # import pdb; pdb.set_trace()
+    #         batch_for_logprob = copy.deepcopy(batch)
+    #         tune_bs = self.config.data.get("tune_bs", None)
+    #         print(f"[INFO] tune_bs: {tune_bs}, expected_prompt_num: {expected_prompt_num}", flush=True)
+    #         if tune_bs is not None:
+    #             tune_bs = int(tune_bs)
+    #             assert tune_bs > 0, f"tune_bs must be > 0, got {tune_bs}."
+    #             assert tune_bs <= expected_prompt_num, (
+    #                 f"tune_bs must be <= {expected_prompt_num}, got {tune_bs}."
+    #             )
+    #             if tune_bs < expected_prompt_num:
+    #                 # 按首次出现顺序选取 prompt UID
+    #                 uid_indices_cpu = uid_indices.detach().cpu()
+    #                 uid_indices_np = uid_indices_cpu.numpy()
+    #                 first_pos = np.full((num_unique_uids,), batch_size, dtype=np.int64)
+    #                 for idx, uid in enumerate(uid_indices_np):
+    #                     if idx < first_pos[uid]:
+    #                         first_pos[uid] = idx
+    #                 ordered_uids = np.argsort(first_pos)
+    #                 uids_to_keep_np = ordered_uids[:tune_bs]
 
-                    keep_mask = np.isin(uid_indices_np, uids_to_keep_np)
-                    batch = batch.select_idxs(keep_mask)
+    #                 keep_mask = np.isin(uid_indices_np, uids_to_keep_np)
+    #                 batch = batch.select_idxs(keep_mask)
 
-                    # 重新映射 uid，保证从 0..tune_bs-1 的连续编号
-                    uid_map = np.full((num_unique_uids,), -1, dtype=np.int64)
-                    uid_map[uids_to_keep_np] = np.arange(tune_bs, dtype=np.int64)
-                    new_uid = uid_map[uid_indices_np[keep_mask]]
-                    uid_indices = torch.from_numpy(new_uid).to(uid_indices.device)
+    #                 # 重新映射 uid，保证从 0..tune_bs-1 的连续编号
+    #                 uid_map = np.full((num_unique_uids,), -1, dtype=np.int64)
+    #                 uid_map[uids_to_keep_np] = np.arange(tune_bs, dtype=np.int64)
+    #                 new_uid = uid_map[uid_indices_np[keep_mask]]
+    #                 uid_indices = torch.from_numpy(new_uid).to(uid_indices.device)
             
-            # import pdb; pdb.set_trace()
-            print(f"[INFO] len batch: {len(batch)}", flush=True)
+    #         # import pdb; pdb.set_trace()
+    #         print(f"[INFO] len batch: {len(batch)}", flush=True)
 
-            # 4. 将结果存入 batch.non_tensor_batch['uid']
-            # 将 tensor 转为 list (non_tensor_batch 通常存非 tensor 数据)
-            # 这样相同的 prompt 前缀会有相同的整数 ID
-            uid_np = uid_indices.cpu().numpy().astype(np.int64)
-            # import pdb; pdb.set_trace()
+    #         # 4. 将结果存入 batch.non_tensor_batch['uid']
+    #         # 将 tensor 转为 list (non_tensor_batch 通常存非 tensor 数据)
+    #         # 这样相同的 prompt 前缀会有相同的整数 ID
+    #         uid_np = uid_indices.cpu().numpy().astype(np.int64)
+    #         # import pdb; pdb.set_trace()
 
-            batch.non_tensor_batch['uid'] = uid_np
-            batch.meta_info["temperature"] = 1.0
-            batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+    #         batch.non_tensor_batch['uid'] = uid_np
+    #         batch.meta_info["temperature"] = 1.0
+    #         batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
-            # import pdb; pdb.set_trace()
+    #         # import pdb; pdb.set_trace()
 
-            norm_adv_by_std_in_grpo = self.config.get("norm_adv_by_std_in_grpo", True)
-            batch = compute_advantage(
-                batch,
-                adv_estimator=AdvantageEstimator.GRPO,
-                gamma=self.config.algorithm,
-                lam=self.config.algorithm.lam,
-                num_repeat=self.config.actor_rollout_ref.rollout.n,
-                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                config=self.config.algorithm,
-            )
+    #         norm_adv_by_std_in_grpo = self.config.get("norm_adv_by_std_in_grpo", True)
+    #         batch = compute_advantage(
+    #             batch,
+    #             adv_estimator=AdvantageEstimator.GRPO,
+    #             gamma=self.config.algorithm,
+    #             lam=self.config.algorithm.lam,
+    #             num_repeat=self.config.actor_rollout_ref.rollout.n,
+    #             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+    #             config=self.config.algorithm,
+    #         )
 
-            # import pdb; pdb.set_trace()
+    #         # import pdb; pdb.set_trace()
 
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
+    #         timestamp = time.strftime("%Y%m%d_%H%M%S")
 
-            for i in range(80):
-                grpo_actor_output = self.actor_rollout_wg.update_actor_onpolicydistill(batch)
-                print(f"[INFO] update step: {i}", flush=True)
-                print(f"[INFO] output: {grpo_actor_output}", flush=True)
+    #         for i in range(80):
+    #             grpo_actor_output = self.actor_rollout_wg.update_actor_onpolicydistill(batch)
+    #             print(f"[INFO] update step: {i}", flush=True)
+    #             print(f"[INFO] output: {grpo_actor_output}", flush=True)
 
-                # Log worker output metrics (from update_actor) to tracking backends (e.g., wandb).
-                try:
-                    output_metrics = grpo_actor_output.meta_info.get("metrics", {})
-                    output_metrics = reduce_metrics(output_metrics)
-                    output_metrics["train/inner_update_step"] = i
-                    # Ensure monotonically increasing steps for logging.
-                    log_step = int(i)
-                    logger.log(data=output_metrics, step=log_step)
-                except Exception as e:
-                    print(f"[WARN] failed to log update_actor output metrics: {e}", flush=True)
+    #             # Log worker output metrics (from update_actor) to tracking backends (e.g., wandb).
+    #             try:
+    #                 output_metrics = grpo_actor_output.meta_info.get("metrics", {})
+    #                 output_metrics = reduce_metrics(output_metrics)
+    #                 output_metrics["train/inner_update_step"] = i
+    #                 # Ensure monotonically increasing steps for logging.
+    #                 log_step = int(i)
+    #                 logger.log(data=output_metrics, step=log_step)
+    #             except Exception as e:
+    #                 print(f"[WARN] failed to log update_actor output metrics: {e}", flush=True)
 
-                logprob_batch_key = ["input_ids", "attention_mask", "position_ids", "responses"]
-                logprob_batch = batch_for_logprob.select(batch_keys=logprob_batch_key)
-                # logprob_batch.meta_info = batch.meta_info
-                logprob_batch.meta_info["temperature"] = 1.0
-                logprob_batch.meta_info["global_token_num"] = torch.sum(logprob_batch.batch["attention_mask"], dim=-1).tolist()
+    #             logprob_batch_key = ["input_ids", "attention_mask", "position_ids", "responses"]
+    #             logprob_batch = batch_for_logprob.select(batch_keys=logprob_batch_key)
+    #             # logprob_batch.meta_info = batch.meta_info
+    #             logprob_batch.meta_info["temperature"] = 1.0
+    #             logprob_batch.meta_info["global_token_num"] = torch.sum(logprob_batch.batch["attention_mask"], dim=-1).tolist()
 
-                # import pdb; pdb.set_trace()
+    #             # import pdb; pdb.set_trace()
 
-                print(f"[INFO] start compute logprobs", flush=True)
-                logprob_after = self.actor_rollout_wg.compute_log_prob(logprob_batch)
+    #             print(f"[INFO] start compute logprobs", flush=True)
+    #             logprob_after = self.actor_rollout_wg.compute_log_prob(logprob_batch)
 
-                logprobs = logprob_after.batch['old_log_probs']
-                entropys = logprob_after.batch['entropys']
+    #             logprobs = logprob_after.batch['old_log_probs']
+    #             entropys = logprob_after.batch['entropys']
 
-                # import pdb; pdb.set_trace()
+    #             # import pdb; pdb.set_trace()
 
-                dump_data = {
-                    "input_ids": batch.batch['input_ids'],
-                    'attention_mask': batch.batch["attention_mask"],
+    #             dump_data = {
+    #                 "input_ids": batch.batch['input_ids'],
+    #                 'attention_mask': batch.batch["attention_mask"],
 
-                    "grpo_logprob_after": batch.batch["grpo_logprob_after"],
-                    "nsr_logprob_after": batch.batch["nsr_logprob_after"],
-                    "psr_logprob_after": batch.batch["psr_logprob_after"],
+    #                 "grpo_logprob_after": batch.batch["grpo_logprob_after"],
+    #                 "nsr_logprob_after": batch.batch["nsr_logprob_after"],
+    #                 "psr_logprob_after": batch.batch["psr_logprob_after"],
 
-                    "rollout_logprobs": logprobs,
-                    "rollout_entropys": entropys,
+    #                 "rollout_logprobs": logprobs,
+    #                 "rollout_entropys": entropys,
 
-                    "old_log_probs": batch.batch["old_log_probs"],
-                    "response_masks": batch.batch["response_masks"],
-                    "responses": batch.batch["responses"],
+    #                 "old_log_probs": batch.batch["old_log_probs"],
+    #                 "response_masks": batch.batch["response_masks"],
+    #                 "responses": batch.batch["responses"],
 
-                    "grpo_current_entropys": batch.batch["grpo_current_entropys"],
-                    "nsr_current_entropys": batch.batch["nsr_current_entropys"],
-                    "psr_current_entropys": batch.batch["psr_current_entropys"],
+    #                 "grpo_current_entropys": batch.batch["grpo_current_entropys"],
+    #                 "nsr_current_entropys": batch.batch["nsr_current_entropys"],
+    #                 "psr_current_entropys": batch.batch["psr_current_entropys"],
 
-                    "score": batch.non_tensor_batch["score"]
-                }
+    #                 "score": batch.non_tensor_batch["score"]
+    #             }
 
-                dump_path = f"/home/ma-user/work/dev/_experiments/verl/_psrnsr/EXP44_128_64/playground/onpolicy-distill/{timestamp}/{i}.pt"
-                os.makedirs(os.path.dirname(dump_path), exist_ok=True)
-                torch.save(dump_data, dump_path)
+    #             dump_path = f"/home/ma-user/work/dev/_experiments/verl/_psrnsr/EXP44_128_64/playground/onpolicy-distill/{timestamp}/{i}.pt"
+    #             os.makedirs(os.path.dirname(dump_path), exist_ok=True)
+    #             torch.save(dump_data, dump_path)
 
 
             
-            print(f"[INFO] finish", flush=True)
-            # self._save_temp_checkpoint("/home/ma-user/work/dev/_experiments/verl/_psrnsr/EXP44_128_64/playground/step40_pie")
+    #         print(f"[INFO] finish", flush=True)
+    #         # self._save_temp_checkpoint("/home/ma-user/work/dev/_experiments/verl/_psrnsr/EXP44_128_64/playground/step40_pie")
 
 
 
 
-            # logprob_batch_key = ["input_ids", "attention_mask", "position_ids", "responses"]
-            # logprob_batch = batch.select(batch_keys=logprob_batch_key)
+    #         # logprob_batch_key = ["input_ids", "attention_mask", "position_ids", "responses"]
+    #         # logprob_batch = batch.select(batch_keys=logprob_batch_key)
 
-            # # recompute logprob after
-            # print(f"[INFO] start calculate logprobs", flush=True)
-            # logprob_after = self.actor_rollout_wg.compute_log_prob(logprob_batch)
-            # logprobs = logprob_after.batch['old_log_probs']
-            # entropys = logprob_after.batch['entropys']
-            # # logdiff = batch.batch['grpo_logprob_after'] - logprobs
+    #         # # recompute logprob after
+    #         # print(f"[INFO] start calculate logprobs", flush=True)
+    #         # logprob_after = self.actor_rollout_wg.compute_log_prob(logprob_batch)
+    #         # logprobs = logprob_after.batch['old_log_probs']
+    #         # entropys = logprob_after.batch['entropys']
+    #         # # logdiff = batch.batch['grpo_logprob_after'] - logprobs
 
-            # print(f"[INFO] end calculate logprobs", flush=True)
+    #         # print(f"[INFO] end calculate logprobs", flush=True)
 
-            # dump_data = {
-            #     "input_ids": batch.batch['input_ids'],
-            #     'attention_mask': batch.batch["attention_mask"],
+    #         # dump_data = {
+    #         #     "input_ids": batch.batch['input_ids'],
+    #         #     'attention_mask': batch.batch["attention_mask"],
 
-            #     "grpo_logprob_after": batch.batch["grpo_logprob_after"],
-            #     "nsr_logprob_after": batch.batch["nsr_logprob_after"],
-            #     "psr_logprob_after": batch.batch["psr_logprob_after"],
+    #         #     "grpo_logprob_after": batch.batch["grpo_logprob_after"],
+    #         #     "nsr_logprob_after": batch.batch["nsr_logprob_after"],
+    #         #     "psr_logprob_after": batch.batch["psr_logprob_after"],
 
-            #     "rollout_logprobs": logprobs,
-            #     "rollout_entropys": entropys,
+    #         #     "rollout_logprobs": logprobs,
+    #         #     "rollout_entropys": entropys,
 
 
-            #     "old_log_probs": batch.batch["old_log_probs"],
-            #     "response_masks": batch.batch["response_masks"],
-            #     "responses": batch.batch["responses"],
+    #         #     "old_log_probs": batch.batch["old_log_probs"],
+    #         #     "response_masks": batch.batch["response_masks"],
+    #         #     "responses": batch.batch["responses"],
 
-            #     "grpo_current_entropys": batch.batch["grpo_current_entropys"],
-            #     "nsr_current_entropys": batch.batch["nsr_current_entropys"],
-            #     "psr_current_entropys": batch.batch["psr_current_entropys"],
+    #         #     "grpo_current_entropys": batch.batch["grpo_current_entropys"],
+    #         #     "nsr_current_entropys": batch.batch["nsr_current_entropys"],
+    #         #     "psr_current_entropys": batch.batch["psr_current_entropys"],
 
-            #     "score": batch.non_tensor_batch["score"]
-            # }
+    #         #     "score": batch.non_tensor_batch["score"]
+    #         # }
 
-            # # import pdb; pdb.set_trace()
-            # dump_path = self.config.data.save_path
-            # torch.save(dump_data, dump_path)
-            # exit(-1)
+    #         # # import pdb; pdb.set_trace()
+    #         # dump_path = self.config.data.save_path
+    #         # torch.save(dump_data, dump_path)
+    #         # exit(-1)

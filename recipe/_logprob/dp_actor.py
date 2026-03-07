@@ -698,7 +698,7 @@ class DataParallelPPOActor(BasePPOActor):
 
         # import pdb; pdb.set_trace()
 
-        mini_batch = len(data) // 2
+        mini_batch = len(data)
         mini_batches = data.split(mini_batch)
 
         print(f"[INFO] len mini_batches: {len(mini_batches)}, split_batch: {mini_batch}", flush=True)
@@ -843,7 +843,7 @@ class DataParallelPPOActor(BasePPOActor):
                             "actor/pg_loss": pg_loss.detach().item() * loss_scale_factor,
                             "actor/pg_clipfrac": pg_clipfrac.detach().item(),
                             "actor/ppo_kl": ppo_kl.detach().item(),
-                            "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+                            # "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
                         }
                     )
                     append_to_dict(metrics, micro_batch_metrics)
