@@ -894,6 +894,60 @@ class RayPPOTrainer:
 
             batch: DataProto = DataProto.from_single_dict(new_batch_dict)
 
+            # ------------------------------------------------------------------
+            # 1. Generate uid by grouping on prompt (first 8192 tokens of input_ids)
+            # ------------------------------------------------------------------
+            prefix_len = batch.batch["input_ids"].shape[1] - batch.batch["responses"].shape[1]
+            prompt_prefix = batch.batch["input_ids"][:, :prefix_len]
+            _, uid_indices = torch.unique(prompt_prefix, return_inverse=True, dim=0)
+            num_unique = uid_indices.max().item() + 1
+            total_samples = uid_indices.numel()
+            rollout_n = self.config.actor_rollout_ref.rollout.n
+            assert total_samples % rollout_n == 0, (
+                f"batch_size={total_samples} not divisible by rollout.n={rollout_n}"
+            )
+            expected_prompts = total_samples // rollout_n
+            assert num_unique == expected_prompts, (
+                f"Expected {expected_prompts} unique prompts, got {num_unique}"
+            )
+            uid_np = uid_indices.cpu().numpy().astype(object)
+            batch.non_tensor_batch["uid"] = uid_np
+            print(f"[INFO] uid: {num_unique} unique prompts, {rollout_n} rollouts each", flush=True)
+
+            # ------------------------------------------------------------------
+            # 2. Build token_level_rewards from score (sparse: last valid token)
+            # ------------------------------------------------------------------
+            scores_np = batch.non_tensor_batch["score"]  # numpy (bs,)
+            scores = torch.tensor(scores_np, dtype=torch.float32)  # (bs,)
+            response_mask = batch.batch["response_masks"]  # (bs, resp_len)
+            response_length = response_mask.shape[1]
+            token_level_rewards = torch.zeros(
+                (total_samples, response_length), dtype=torch.float32,
+            )
+            seq_lengths = response_mask.sum(dim=1).long()
+            last_token_idx = (seq_lengths - 1).clamp(min=0)
+            token_level_rewards[torch.arange(total_samples), last_token_idx] = scores
+            token_level_rewards = token_level_rewards * response_mask
+            batch.batch["token_level_rewards"] = token_level_rewards
+            batch.batch["response_mask"] = response_mask
+
+            # ------------------------------------------------------------------
+            # 3. Compute advantage via GRPO
+            # ------------------------------------------------------------------
+            algo_config = self.config.algorithm
+            batch = compute_advantage(
+                data=batch,
+                adv_estimator=AdvantageEstimator(algo_config.adv_estimator),
+                gamma=algo_config.get("gamma", 1.0),
+                lam=algo_config.get("lam", 1.0),
+                num_repeat=rollout_n,
+                norm_adv_by_std_in_grpo=algo_config.get("norm_adv_by_std_in_grpo", True),
+                config=algo_config,
+            )
+            print(f"[INFO] advantages computed, shape={batch.batch['advantages'].shape}", flush=True)
+
+            import pdb; pdb.set_trace()
+
             # Process samples in configurable chunks to control memory (default 1).
             dump_chunk_size = int(self.config.phi.get("dump_batch_size", 4))
             print(f"[INFO] dump_chunk_size: {dump_chunk_size}", flush=True)
@@ -908,16 +962,18 @@ class RayPPOTrainer:
                 # enable phi top-k computation on worker if configured
                 logprob_batch.meta_info["phi_enable"] = bool(self.config.phi.enable)
                 logprob_batch.meta_info["phi_topk_k"] = int(self.config.phi.get("topk_k", 100))
+                logprob_batch.meta_info["hidden_enable"] = bool(self.config.phi.get("hidden_enable", False))
 
                 print(f"[INFO] start calculate logprobs for samples {start_idx}:{end_idx}", flush=True)
                 logprob_after = self.actor_rollout_wg.compute_log_prob(logprob_batch)
                 print(f"[INFO] end calculate logprobs for samples {start_idx}:{end_idx}", flush=True)
 
-                import pdb; pdb.set_trace()
+                # import pdb; pdb.set_trace()
 
                 dump_data = {
                     "input_ids": sample_chunk.batch["input_ids"].cpu(),
                     "response_masks": sample_chunk.batch["response_masks"].cpu(),
+                    "uid": sample_chunk.non_tensor_batch["uid"] if "uid" in sample_chunk.non_tensor_batch else None,
                 }
 
                 dump_data["old_log_probs"] = (
@@ -925,17 +981,26 @@ class RayPPOTrainer:
                 )
                 if "grpo_current_entropys" in sample_chunk.batch:
                     dump_data["grpo_current_entropys"] = sample_chunk.batch["grpo_current_entropys"].cpu()
+                if "advantages" in sample_chunk.batch:
+                    dump_data["advantages"] = sample_chunk.batch["advantages"].cpu()
+                if "score" in sample_chunk.non_tensor_batch:
+                    dump_data["score"] = sample_chunk.non_tensor_batch["score"]
 
                 phi_topk_ids = None
                 phi_topk_logprobs = None
+                hidden_states = None
                 if logprob_after.batch is not None:
                     phi_topk_ids = logprob_after.batch.get("phi_topk_ids", None)
                     phi_topk_logprobs = logprob_after.batch.get("phi_topk_logprobs", None)
+                    hidden_states = logprob_after.batch.get("hidden_states", None)
                 dump_data["phi_topk_ids"] = phi_topk_ids.cpu() if phi_topk_ids is not None else None
                 dump_data["phi_topk_logprobs"] = phi_topk_logprobs.cpu() if phi_topk_logprobs is not None else None
+                dump_data["hidden_states"] = hidden_states.cpu() if hidden_states is not None else None
 
                 del logprob_after
                 torch.cuda.empty_cache()
+
+                # import pdb; pdb.set_trace()
 
                 dump_path_base = self.config.phi.get("save_path", None) or self.config.data.save_path
 
