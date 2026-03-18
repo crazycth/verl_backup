@@ -271,6 +271,7 @@ def compute_grpo_outcome_advantage(
     token_level_rewards: torch.Tensor,
     response_mask: torch.Tensor,
     index: np.ndarray,
+    score: Optional[np.ndarray | list | torch.Tensor] = None,
     epsilon: float = 1e-6,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
@@ -286,6 +287,8 @@ def compute_grpo_outcome_advantage(
             shape is (bs, response_length)
         index: `(np.ndarray)`
             index array for grouping
+        score: `(Optional[np.ndarray | list | torch.Tensor])`
+            rollout-level score used to identify negative samples
         epsilon: `(float)`
             small value to avoid division by zero
         norm_adv_by_std_in_grpo: `(bool)`
@@ -305,6 +308,7 @@ def compute_grpo_outcome_advantage(
     """
     print(f"[INFO] use reward mode: grpo", flush=True)
     scores = token_level_rewards.sum(dim=-1)
+    neg_overlong_adv_scale = config.get("neg_overlong_adv_scale", 1.0) if config is not None else 1.0
 
     id2score = defaultdict(list)
     id2mean = {}
@@ -329,6 +333,17 @@ def compute_grpo_outcome_advantage(
                 scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
             else:
                 scores[i] = scores[i] - id2mean[index[i]]
+
+        if score is not None and neg_overlong_adv_scale != 1.0:
+            response_length = response_mask.sum(dim=-1)
+            max_response_length = response_mask.shape[-1]
+            if isinstance(score, torch.Tensor):
+                score_tensor = score.detach().to(device=scores.device, dtype=scores.dtype)
+            else:
+                score_tensor = torch.as_tensor(score, device=scores.device, dtype=scores.dtype)
+            neg_overlong_mask = (score_tensor <= 0) & (response_length == max_response_length)
+            scores[neg_overlong_mask] = scores[neg_overlong_mask] * neg_overlong_adv_scale
+
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores

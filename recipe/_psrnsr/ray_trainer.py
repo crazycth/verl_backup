@@ -252,6 +252,8 @@ def compute_advantage(
             response_mask=grpo_calculation_mask,
             index=data.non_tensor_batch["uid"],
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            score=data.non_tensor_batch.get("score"),
+            config=config,
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
@@ -1290,6 +1292,126 @@ class RayPPOTrainer:
             metrics["post_process/entropy/dist_fairness_ratio"] = (inter_q_min + 1e-6) / (inter_q_max + 1e-6)
             
             # [新增：正负例分布]
+            metrics["post_process/entropy/valid_token/pos"] = pos_valid_sum
+            metrics["post_process/entropy/valid_token/neg"] = neg_valid_sum
+
+        elif method == "entropy-clip-posneg":
+            if entropy is None:
+                raise ValueError("[INFO] entropy is required when method=entropy-clip-posneg")
+
+            clip_mode = self.config.trainer.entropy_clip_mode
+            clip_ratio = self.config.trainer.entropy_clip_ratio
+
+            # Global budget from response_mask; then split by label budget.
+            valid_mask = response_mask.bool()
+            total_valid_tokens = int(valid_mask.sum().item())
+            if total_valid_tokens <= 0:
+                raise ValueError("[INFO] no valid tokens found for entropy-clip-posneg")
+
+            if clip_mode == "ratio":
+                pos_ratio = float(self.config.trainer.get("entropy_clip_pos_ratio", 0.1))
+                neg_ratio = float(self.config.trainer.get("entropy_clip_neg_ratio", 0.1))
+                if pos_ratio < 0 or neg_ratio < 0:
+                    raise ValueError(
+                        f"[INFO] invalid ratio in entropy-clip-posneg: pos_ratio={pos_ratio}, neg_ratio={neg_ratio}"
+                    )
+                k_pos_target = int(total_valid_tokens * pos_ratio)
+                k_neg_target = int(total_valid_tokens * neg_ratio)
+            elif clip_mode == "num":
+                total_k = int(clip_ratio)
+                total_k = min(total_k, total_valid_tokens)
+                pos_num = self.config.trainer.get("entropy_clip_pos_num", None)
+                neg_num = self.config.trainer.get("entropy_clip_neg_num", None)
+                if pos_num is not None or neg_num is not None:
+                    if pos_num is None or neg_num is None:
+                        raise ValueError(
+                            "[INFO] both entropy_clip_pos_num and entropy_clip_neg_num must be set when clip_mode=num"
+                        )
+                    k_pos_target = int(pos_num)
+                    k_neg_target = int(neg_num)
+                else:
+                    # Backward-compatible default for num mode.
+                    k_pos_target = total_k // 2
+                    k_neg_target = total_k - k_pos_target
+            else:
+                raise ValueError(f"[INFO] unknown entropy_clip_mode: {clip_mode}")
+
+            score_tensor = torch.as_tensor(scores, device=response_mask.device)
+            is_pos_row = score_tensor > 0
+            is_neg_row = score_tensor == 0
+
+            pos_token_mask = valid_mask & is_pos_row.unsqueeze(-1)
+            neg_token_mask = valid_mask & is_neg_row.unsqueeze(-1)
+
+            pos_available = int(pos_token_mask.sum().item())
+            neg_available = int(neg_token_mask.sum().item())
+
+            # Force split by label; no spill-over from one side to the other.
+            k_pos = min(k_pos_target, pos_available)
+            k_neg = min(k_neg_target, neg_available)
+
+            flat_entropy = entropy.clone().view(-1)
+            flat_pos_mask = pos_token_mask.view(-1)
+            flat_neg_mask = neg_token_mask.view(-1)
+            new_flat_mask = torch.zeros_like(flat_entropy, dtype=response_mask.dtype)
+
+            if k_pos > 0:
+                pos_entropy = flat_entropy.masked_fill(~flat_pos_mask, -float("inf"))
+                _, pos_topk_indices = torch.topk(pos_entropy, k_pos)
+                new_flat_mask[pos_topk_indices] = 1
+
+            if k_neg > 0:
+                neg_entropy = flat_entropy.masked_fill(~flat_neg_mask, -float("inf"))
+                _, neg_topk_indices = torch.topk(neg_entropy, k_neg)
+                new_flat_mask[neg_topk_indices] = 1
+
+            batch.batch["response_mask"] = new_flat_mask.view_as(response_mask)
+
+            row_token_counts = batch.batch["response_mask"].sum(dim=1).float().cpu().numpy()
+            uids = batch.non_tensor_batch["uid"]
+
+            uid_stats = defaultdict(list)
+            for uid, count in zip(uids, row_token_counts):
+                uid_stats[uid].append(count)
+
+            query_total_tokens = []
+            for _, counts in uid_stats.items():
+                query_total_tokens.append(np.sum(counts))
+
+            q_totals = np.array(query_total_tokens) if len(query_total_tokens) > 0 else np.array([0.0])
+            inter_q_max = np.max(q_totals)
+            inter_q_min = np.min(q_totals)
+            inter_q_mean = np.mean(q_totals)
+            inter_q_std = np.std(q_totals)
+
+            scores_numpy = np.array(scores)
+            is_pos = (scores_numpy > 0)
+            is_neg = (scores_numpy == 0)
+            pos_valid_sum = np.sum(row_token_counts[is_pos])
+            neg_valid_sum = np.sum(row_token_counts[is_neg])
+
+            log_msg = [f"[INFO] entropy-clip-posneg ({clip_mode}={clip_ratio}) Monitor:"]
+            log_msg.append(
+                f"  >> TargetKeep: Pos={k_pos_target}, Neg={k_neg_target}, Total={k_pos_target + k_neg_target}"
+            )
+            log_msg.append(f"  >> Available: Pos={pos_available}, Neg={neg_available}")
+            log_msg.append(f"  >> ActualKeep: Pos={k_pos}, Neg={k_neg}, Total={k_pos + k_neg}")
+            log_msg.append(f"  >> Split: PosTokens={int(pos_valid_sum)}, NegTokens={int(neg_valid_sum)}")
+            log_msg.append(f"  >> Fairness: Min={inter_q_min}, Max={inter_q_max}, Mean={inter_q_mean:.1f}")
+            print("\n".join(log_msg), flush=True)
+
+            metrics["post_process/entropy/total_kept"] = k_pos + k_neg
+            metrics["post_process/entropy/target_total_kept"] = k_pos_target + k_neg_target
+            metrics["post_process/entropy/target_kept/pos"] = k_pos_target
+            metrics["post_process/entropy/target_kept/neg"] = k_neg_target
+            metrics["post_process/entropy/actual_kept/pos"] = k_pos
+            metrics["post_process/entropy/actual_kept/neg"] = k_neg
+            metrics["post_process/entropy/available/pos"] = pos_available
+            metrics["post_process/entropy/available/neg"] = neg_available
+            metrics["post_process/entropy/dist_inter_query_min"] = inter_q_min
+            metrics["post_process/entropy/dist_inter_query_max"] = inter_q_max
+            metrics["post_process/entropy/dist_inter_query_std"] = inter_q_std
+            metrics["post_process/entropy/dist_fairness_ratio"] = (inter_q_min + 1e-6) / (inter_q_max + 1e-6)
             metrics["post_process/entropy/valid_token/pos"] = pos_valid_sum
             metrics["post_process/entropy/valid_token/neg"] = neg_valid_sum
 
