@@ -1251,10 +1251,34 @@ class RayPPOTrainer:
         delta_full_map = full_logprob - policy0_logprob
 
         bucket_defs = iter_peer_buckets()
+        total_bucket_count = total_candidates * len(bucket_defs)
+        total_masked_max = total_bucket_count * (random_peer_set_count + 1)
         summary_store: dict[tuple[int, bool, bool, int], dict[str, Any]] = {}
         summary_meta: dict[tuple[int, bool, bool, int], dict[str, Any]] = {}
+        skipped_bucket_count = 0
+        masked_done_count = 0
 
-        for cand_idx in tqdm(range(total_candidates), desc="causal_probe"):
+        candidate_pbar = tqdm(
+            range(total_candidates),
+            total=total_candidates,
+            desc="[causal][all] candidates",
+            position=0,
+            leave=True,
+        )
+        bucket_all_pbar = tqdm(
+            total=total_bucket_count,
+            desc="[causal][all] buckets",
+            position=1,
+            leave=True,
+        )
+        masked_all_pbar = tqdm(
+            total=total_masked_max,
+            desc="[causal][all] masked_updates(max)",
+            position=2,
+            leave=True,
+        )
+
+        for cand_idx in candidate_pbar:
             r = int(row_idx[cand_idx])
             c = int(col_idx[cand_idx])
             tok = int(token_id[cand_idx])
@@ -1263,6 +1287,10 @@ class RayPPOTrainer:
             target_entropy = float(policy0_entropys[r, c].item())
             target_adv = float(advantages[r, c].item())
             delta_full = float(delta_full_map[r, c].item())
+            candidate_pbar.set_postfix(
+                {"cand": f"{cand_idx + 1}/{total_candidates}", "target": f"{r}:{c}", "tok": tok},
+                refresh=False,
+            )
 
             target_record_common = {
                 "checkpoint": checkpoint_id,
@@ -1306,7 +1334,21 @@ class RayPPOTrainer:
             peer_base_mask[r, c] = False
             token_same_mask = responses == tok
 
-            for bucket_idx, bucket in enumerate(bucket_defs):
+            bucket_pbar = tqdm(
+                enumerate(bucket_defs),
+                total=len(bucket_defs),
+                desc=f"[causal][cand={cand_idx}] buckets",
+                position=3,
+                leave=False,
+            )
+            for bucket_idx, bucket in bucket_pbar:
+                bucket_all_pbar.update(1)
+                bucket_label = (
+                    f"same={int(bool(bucket['is_same_token']))},"
+                    f"high={int(bool(bucket['is_high_entropy']))},"
+                    f"adv={int(bucket['adv_sign'])}"
+                )
+                bucket_pbar.set_postfix({"bucket": bucket_idx, "label": bucket_label}, refresh=False)
                 key = (
                     cand_idx,
                     bool(bucket["is_same_token"]),
@@ -1345,6 +1387,7 @@ class RayPPOTrainer:
                 if peer_pool_size < peer_set_size:
                     summary_store[key]["total"] += 1
                     summary_store[key]["skipped"] += 1
+                    skipped_bucket_count += 1
                     skip_record = dict(target_record_common)
                     skip_record.update(
                         {
@@ -1364,6 +1407,10 @@ class RayPPOTrainer:
                         }
                     )
                     self._append_jsonl(result_path, skip_record)
+                    masked_all_pbar.set_postfix(
+                        {"done": masked_done_count, "skipped_bucket": skipped_bucket_count},
+                        refresh=False,
+                    )
                     continue
 
                 sample_specs: list[tuple[str, int, np.ndarray]] = []
@@ -1384,8 +1431,19 @@ class RayPPOTrainer:
                 top_order = np.argsort(-peer_scores)[:peer_set_size]
                 sample_specs.append(("top_scored", 0, peer_positions[top_order]))
 
-                for sample_type, sample_idx, selected_peers in sample_specs:
+                peer_pbar = tqdm(
+                    sample_specs,
+                    total=len(sample_specs),
+                    desc=f"[causal][peer] cand={cand_idx} bucket={bucket_idx} {bucket_label}",
+                    position=4,
+                    leave=False,
+                )
+                for sample_type, sample_idx, selected_peers in peer_pbar:
                     summary_store[key]["total"] += 1
+                    peer_pbar.set_postfix(
+                        {"type": sample_type, "idx": int(sample_idx), "peer_n": int(selected_peers.shape[0])},
+                        refresh=False,
+                    )
                     intervention_mask = valid_response_mask.clone()
                     if selected_peers.shape[0] > 0:
                         rr = torch.from_numpy(selected_peers[:, 0]).to(device=responses.device, dtype=torch.long)
@@ -1423,6 +1481,18 @@ class RayPPOTrainer:
                         }
                     )
                     self._append_jsonl(result_path, record)
+                    masked_done_count += 1
+                    masked_all_pbar.update(1)
+                    masked_all_pbar.set_postfix(
+                        {"done": masked_done_count, "skipped_bucket": skipped_bucket_count},
+                        refresh=False,
+                    )
+                peer_pbar.close()
+            bucket_pbar.close()
+
+        candidate_pbar.close()
+        bucket_all_pbar.close()
+        masked_all_pbar.close()
 
         for key, stats in summary_store.items():
             taus = np.asarray(stats["taus"], dtype=np.float64)
