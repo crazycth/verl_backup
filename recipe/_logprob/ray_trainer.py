@@ -23,6 +23,7 @@ import os
 import uuid
 import copy
 import time
+import random
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -358,91 +359,122 @@ def build_prompt_uid(
     return inverse
 
 
-def get_response_mask(
-    strategy: str,
-    base_response_mask: torch.Tensor,
-    responses: torch.Tensor,
-    row_idx: int,
-    col_idx: int,
-    token_id: int,
-    *,
-    random_n: int = 0,
-    rng: Optional[torch.Generator] = None,
-    prompt_uid: Optional[torch.Tensor] = None,
-    adv_sign: Optional[torch.Tensor] = None,
-    keep_candidate_grad: bool = True,
-) -> torch.Tensor:
-    if not (0 <= row_idx < responses.shape[0]) or not (0 <= col_idx < responses.shape[1]):
-        raise IndexError(
-            f"Candidate index out of range: row_idx={row_idx}, col_idx={col_idx}, "
-            f"shape={tuple(responses.shape)}"
-        )
+def normalize_batch_dict(batch_dict: dict[str, Any]) -> dict[str, Any]:
+    normalized_batch_dict: dict[str, Any] = {}
+    for key, value in batch_dict.items():
+        if hasattr(value, "shape") and value.shape[0] == 1:
+            normalized_batch_dict[key] = value[0]
+        elif isinstance(value, list) and len(value) == 1:
+            normalized_batch_dict[key] = value[0]
+        else:
+            normalized_batch_dict[key] = value
+    return normalized_batch_dict
 
-    observed_token = int(responses[row_idx, col_idx].item())
-    if observed_token != int(token_id):
-        raise AssertionError(
-            f"Candidate token mismatch at (row={row_idx}, col={col_idx}): "
-            f"expected token_id={token_id}, found={observed_token}"
-        )
 
-    valid_mask = base_response_mask > 0
-    if not bool(valid_mask[row_idx, col_idx].item()):
-        raise AssertionError(
-            f"Candidate token must satisfy response_mask==1, but got 0 at (row={row_idx}, col={col_idx})"
-        )
+def build_sparse_token_level_rewards_if_missing(batch: DataProto) -> None:
+    if "token_level_rewards" in batch.batch:
+        return
+    if "score" not in batch.non_tensor_batch:
+        raise KeyError("Missing non_tensor_batch['score'], cannot build token-level rewards.")
 
-    new_mask = valid_mask.clone()
-    strategy = str(strategy).lower()
-
-    if strategy == "random-n":
-        random_n = int(random_n)
-        if random_n > 0:
-            candidates = valid_mask.clone()
-            candidates[row_idx, col_idx] = False
-            valid_pos = candidates.nonzero(as_tuple=False)
-            pick_n = min(random_n, int(valid_pos.shape[0]))
-            if pick_n > 0:
-                perm = torch.randperm(valid_pos.shape[0], generator=rng, device=valid_pos.device)[:pick_n]
-                picked = valid_pos.index_select(0, perm)
-                new_mask[picked[:, 0], picked[:, 1]] = False
-
-    elif strategy == "rollout-mask-token":
-        cond = valid_mask[row_idx] & (responses[row_idx] == int(token_id))
-        new_mask[row_idx, cond] = False
-
-    elif strategy in ("prompt-mask-token-adv", "batch-mask-token-adv"):
-        if adv_sign is None:
-            raise ValueError(f"`adv_sign` is required for strategy `{strategy}`")
-
-        anchor_sign = adv_sign[row_idx, col_idx]
-        token_cond = responses == int(token_id)
-        sign_cond = adv_sign == anchor_sign
-        cond = valid_mask & token_cond & sign_cond
-
-        if strategy == "prompt-mask-token-adv":
-            if prompt_uid is None:
-                raise ValueError("`prompt_uid` is required for `prompt-mask-token-adv`")
-            if prompt_uid.ndim != 1 or prompt_uid.shape[0] != responses.shape[0]:
-                raise ValueError(
-                    f"`prompt_uid` shape must be [batch], got {tuple(prompt_uid.shape)} "
-                    f"for batch={responses.shape[0]}"
-                )
-            group_mask = prompt_uid == prompt_uid[row_idx]
-            cond = cond & group_mask.unsqueeze(1)
-
-        new_mask[cond] = False
-
-    else:
+    response_mask = batch.batch["response_mask"]
+    scores_np = _as_numpy_1d("score", batch.non_tensor_batch["score"]).astype(np.float32, copy=False)
+    if scores_np.shape[0] != response_mask.shape[0]:
         raise ValueError(
-            f"Unsupported strategy `{strategy}`. "
-            f"Supported: random-n, rollout-mask-token, prompt-mask-token-adv, batch-mask-token-adv"
+            f"Score length mismatch: score_len={scores_np.shape[0]}, batch_size={response_mask.shape[0]}"
         )
 
-    if keep_candidate_grad:
-        new_mask[row_idx, col_idx] = True
-    else:
-        new_mask[row_idx, col_idx] = False
-    return new_mask.to(dtype=base_response_mask.dtype)
+    scores = torch.as_tensor(scores_np, dtype=torch.float32, device=response_mask.device)
+    batch_size_local = scores.shape[0]
+    response_len_local = batch.batch["responses"].shape[1]
+
+    token_level_scores = torch.zeros(
+        (batch_size_local, response_len_local), dtype=scores.dtype, device=scores.device
+    )
+    seq_lengths = response_mask.sum(dim=1).long()
+    last_token_indices = (seq_lengths - 1).clamp(min=0)
+    token_level_scores[torch.arange(batch_size_local, device=scores.device), last_token_indices] = scores
+    token_level_scores = token_level_scores * response_mask
+
+    batch.batch["token_level_scores"] = token_level_scores
+    batch.batch["token_level_rewards"] = token_level_scores
+
+
+def compute_high_entropy_threshold(entropys: torch.Tensor, response_mask: torch.Tensor, quantile: float) -> float:
+    valid_ent = entropys[response_mask > 0]
+    if valid_ent.numel() == 0:
+        raise ValueError("No valid response tokens found for entropy threshold.")
+    return float(torch.quantile(valid_ent, quantile).item())
+
+
+def capture_driver_rng_state() -> dict[str, Any]:
+    state = {
+        "random": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["torch_cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_driver_rng_state(state: dict[str, Any]) -> None:
+    random.setstate(state["random"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch_cpu"])
+    if "torch_cuda" in state and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["torch_cuda"])
+
+
+def iter_peer_buckets() -> list[dict[str, Any]]:
+    buckets: list[dict[str, Any]] = []
+    for is_same_token in (True, False):
+        for is_high_entropy in (True, False):
+            for adv_sign in (1, -1):
+                buckets.append(
+                    {
+                        "is_same_token": is_same_token,
+                        "is_high_entropy": is_high_entropy,
+                        "adv_sign": adv_sign,
+                    }
+                )
+    return buckets
+
+
+def score_peer_candidates(
+    responses: torch.Tensor,
+    entropys: torch.Tensor,
+    advantages: torch.Tensor,
+    peer_positions: np.ndarray,
+    target_token_id: int,
+    score_weights: dict[str, float],
+) -> np.ndarray:
+    if peer_positions.shape[0] == 0:
+        return np.empty((0,), dtype=np.float32)
+
+    rows = torch.from_numpy(peer_positions[:, 0]).to(device=responses.device, dtype=torch.long)
+    cols = torch.from_numpy(peer_positions[:, 1]).to(device=responses.device, dtype=torch.long)
+
+    same_feat = (responses[rows, cols] == int(target_token_id)).float()
+    entropy_feat = entropys[rows, cols].float()
+    abs_adv_feat = advantages[rows, cols].abs().float()
+
+    def _zscore(x: torch.Tensor) -> torch.Tensor:
+        mean = x.mean()
+        std = x.std(unbiased=False)
+        if float(std.item()) < 1e-6:
+            return torch.zeros_like(x)
+        return (x - mean) / std
+
+    entropy_z = _zscore(entropy_feat)
+    abs_adv_z = _zscore(abs_adv_feat)
+
+    w_same = float(score_weights.get("same_token", 1.0))
+    w_entropy = float(score_weights.get("entropy", 1.0))
+    w_abs_adv = float(score_weights.get("abs_adv", 1.0))
+
+    score = w_same * same_feat + w_entropy * entropy_z + w_abs_adv * abs_adv_z
+    return score.detach().cpu().numpy().astype(np.float32)
 
 
 class RayPPOTrainer:
@@ -1000,12 +1032,432 @@ class RayPPOTrainer:
         return batch, {}
     
 
-    def _write_results_append(self, result):
-        import os, json
-        path = self.config.trainer.causal.result_path
-        with open(path, "a") as f:
-            f.write(json.dumps(result) + "\n")
-        print(f"[INFO][causal] wrote result to {path}", flush=True)
+    def _append_jsonl(self, path: str, record: dict[str, Any]) -> None:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    @staticmethod
+    def _to_scalar(value: Any) -> Any:
+        if isinstance(value, np.generic):
+            return value.item()
+        if torch.is_tensor(value):
+            if value.numel() == 1:
+                return value.item()
+            return value.detach().cpu().tolist()
+        return value
+
+    def _decode_token(self, token_id: int) -> Optional[str]:
+        if self.tokenizer is None:
+            return None
+        try:
+            return self.tokenizer.decode([int(token_id)], skip_special_tokens=False)
+        except Exception:
+            return None
+
+    def _single_step_update(
+        self,
+        base_batch: DataProto,
+        response_mask: torch.Tensor,
+        temperature: float,
+    ) -> dict[str, Any]:
+        update_batch = deepcopy(base_batch)
+        update_batch.batch["response_mask"] = response_mask.to(dtype=base_batch.batch["response_mask"].dtype)
+        update_batch.meta_info["temperature"] = float(temperature)
+        update_batch.meta_info["global_token_num"] = torch.sum(update_batch.batch["attention_mask"], dim=-1).tolist()
+
+        update_output = self.actor_rollout_wg.update_actor(update_batch)
+        update_metrics: dict[str, Any] = {}
+        if isinstance(update_output, DataProto):
+            metric_dict = update_output.meta_info.get("metrics", {})
+            if isinstance(metric_dict, dict):
+                metric_dict = reduce_metrics(metric_dict)
+                update_metrics = {k: self._to_scalar(v) for k, v in metric_dict.items()}
+        return update_metrics
+
+    def _run_offline_causal_probe(self, causal_cfg: Any) -> None:
+        candidates_path = causal_cfg.get("candidates_path", None)
+        if candidates_path is None:
+            raise ValueError("trainer.causal.candidates_path is required when trainer.causal.enable=True")
+        if not os.path.isabs(candidates_path):
+            candidates_path = os.path.join(os.getcwd(), candidates_path)
+
+        result_path = causal_cfg.get("result_path", None)
+        if result_path is None:
+            result_path = os.path.join(self.config.trainer.default_local_dir, "causal_probe_results.jsonl")
+        if not os.path.isabs(result_path):
+            result_path = os.path.join(os.getcwd(), result_path)
+
+        summary_path = causal_cfg.get("summary_path", None)
+        if summary_path is None:
+            summary_path = f"{result_path}.summary.jsonl"
+        if not os.path.isabs(summary_path):
+            summary_path = os.path.join(os.getcwd(), summary_path)
+
+        result_dir = os.path.dirname(result_path)
+        summary_dir = os.path.dirname(summary_path)
+        if result_dir:
+            os.makedirs(result_dir, exist_ok=True)
+        if summary_dir:
+            os.makedirs(summary_dir, exist_ok=True)
+        open(result_path, "w", encoding="utf-8").close()
+        open(summary_path, "w", encoding="utf-8").close()
+
+        seed = int(causal_cfg.get("seed", 42))
+        max_candidates = causal_cfg.get("max_candidates", None)
+        max_candidates = None if max_candidates is None else int(max_candidates)
+        prompt_len = int(causal_cfg.get("prompt_len", 8192))
+        expected_prompt_num = causal_cfg.get("expected_prompt_num", 128)
+        expected_prompt_num = None if expected_prompt_num is None else int(expected_prompt_num)
+        expected_repeat = causal_cfg.get("expected_repeat_per_prompt", None)
+        if expected_repeat is None:
+            expected_repeat = self.config.actor_rollout_ref.rollout.get("n", None)
+        expected_repeat = None if expected_repeat is None else int(expected_repeat)
+
+        peer_set_size = int(causal_cfg.get("peer_set_size", 3))
+        random_peer_set_count = int(causal_cfg.get("random_peer_set_count", 10))
+        entropy_high_quantile = float(causal_cfg.get("entropy_high_quantile", 0.8))
+        score_weights = causal_cfg.get("top_score_weights", {})
+        if not isinstance(score_weights, dict):
+            score_weights = {}
+        score_weights = {
+            "same_token": float(score_weights.get("same_token", 1.0)),
+            "entropy": float(score_weights.get("entropy", 1.0)),
+            "abs_adv": float(score_weights.get("abs_adv", 1.0)),
+        }
+        temperature = float(causal_cfg.get("temperature", 1.0))
+        tmp_ckpt_dir = causal_cfg.get("tmp_ckpt_dir", f"causal_probe_policy0_step_{self.global_steps}")
+        batch_id = causal_cfg.get("batch_id", "train_batch_0")
+        checkpoint_id = self.config.trainer.get("resume_from_path", None)
+        if checkpoint_id is None:
+            checkpoint_id = "auto_latest_or_scratch"
+
+        print(
+            f"[INFO][causal_probe] start: seed={seed}, peer_set_size={peer_set_size}, "
+            f"random_peer_set_count={random_peer_set_count}, entropy_high_quantile={entropy_high_quantile}",
+            flush=True,
+        )
+        print(
+            "[INFO][causal_probe] hypothesis: strongest effect expected in same-token + high-entropy peers; "
+            "mask adv>0 may lower target delta, mask adv<0 may raise target delta.",
+            flush=True,
+        )
+        print(
+            "[INFO][causal_probe] grad scaler: not used in current _logprob FSDP path (bf16 autocast, no scaler).",
+            flush=True,
+        )
+
+        train_iter = iter(self.train_dataloader)
+        try:
+            batch_dict = next(train_iter)
+        except StopIteration as exc:
+            raise ValueError("Train dataloader is empty, cannot run causal probe.") from exc
+
+        batch: DataProto = DataProto.from_single_dict(normalize_batch_dict(batch_dict))
+        if "response_mask" not in batch.batch:
+            if "response_masks" in batch.batch:
+                batch.batch["response_mask"] = batch.batch["response_masks"]
+            else:
+                batch.batch["response_mask"] = compute_response_mask(batch)
+
+        prompt_uid = build_prompt_uid(
+            batch.batch["input_ids"],
+            prompt_len=prompt_len,
+            expected_prompt_num=expected_prompt_num,
+            expected_repeat_per_prompt=expected_repeat,
+        )
+        batch.non_tensor_batch["uid"] = prompt_uid.detach().cpu().numpy().astype(np.int64)
+
+        candidates = load_causal_candidates(candidates_path)
+        total_candidates = int(candidates["row_idx"].shape[0])
+        if max_candidates is not None:
+            total_candidates = min(total_candidates, max_candidates)
+            for key in list(candidates.keys()):
+                candidates[key] = candidates[key][:total_candidates]
+        print(f"[INFO][causal_probe] loaded candidates={total_candidates} from {candidates_path}", flush=True)
+        if total_candidates == 0:
+            print("[INFO][causal_probe] no candidates, exit.", flush=True)
+            return
+
+        row_idx = candidates["row_idx"]
+        col_idx = candidates["col_idx"]
+        token_id = candidates["token_id"]
+
+        responses = batch.batch["responses"]
+        base_response_mask = batch.batch["response_mask"]
+        batch_size, response_len = responses.shape
+        if np.any((row_idx < 0) | (row_idx >= batch_size)):
+            raise IndexError(f"Candidate row_idx out of range [0, {batch_size}): {row_idx}")
+        if np.any((col_idx < 0) | (col_idx >= response_len)):
+            raise IndexError(f"Candidate col_idx out of range [0, {response_len}): {col_idx}")
+
+        row_idx_t = torch.from_numpy(row_idx).to(device=responses.device, dtype=torch.long)
+        col_idx_t = torch.from_numpy(col_idx).to(device=responses.device, dtype=torch.long)
+        observed = responses[row_idx_t, col_idx_t].detach().cpu().numpy().astype(np.int64)
+        mismatch = np.where(observed != token_id)[0]
+        if mismatch.size > 0:
+            i = int(mismatch[0])
+            raise AssertionError(
+                f"Candidate token mismatch at index {i}: "
+                f"(row={int(row_idx[i])}, col={int(col_idx[i])}), "
+                f"expected={int(token_id[i])}, observed={int(observed[i])}"
+            )
+
+        if "prompt_uid" in candidates:
+            prompt_uid_np = prompt_uid.detach().cpu().numpy().astype(np.int64)
+            mismatch_prompt = np.where(candidates["prompt_uid"].astype(np.int64) != prompt_uid_np[row_idx])[0]
+            if mismatch_prompt.size > 0:
+                i = int(mismatch_prompt[0])
+                raise AssertionError(
+                    f"Candidate prompt_uid mismatch at index {i}: "
+                    f"expected={int(prompt_uid_np[row_idx[i]])}, observed={int(candidates['prompt_uid'][i])}"
+                )
+
+        logprob_batch = batch.select(batch_keys=["input_ids", "attention_mask", "position_ids", "responses"])
+        policy0_out = self.actor_rollout_wg.compute_log_prob(logprob_batch)
+        policy0_logprob = policy0_out.batch["old_log_probs"].detach().clone()
+        policy0_entropys = policy0_out.batch["entropys"].detach().clone()
+        entropy_threshold = compute_high_entropy_threshold(policy0_entropys, base_response_mask, entropy_high_quantile)
+        is_high_entropy = policy0_entropys >= entropy_threshold
+        print(
+            f"[INFO][causal_probe] high entropy threshold q{entropy_high_quantile:.2f}={entropy_threshold:.8f} "
+            "(high := entropy >= threshold, approx top 20%).",
+            flush=True,
+        )
+
+        base_batch = deepcopy(batch)
+        build_sparse_token_level_rewards_if_missing(base_batch)
+        norm_adv_by_std_in_grpo = bool(self.config.algorithm.get("norm_adv_by_std_in_grpo", True))
+        base_batch = compute_advantage(
+            base_batch,
+            adv_estimator=AdvantageEstimator.GRPO,
+            gamma=self.config.algorithm.gamma,
+            lam=self.config.algorithm.lam,
+            num_repeat=self.config.actor_rollout_ref.rollout.n,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            config=self.config.algorithm,
+        )
+        advantages = base_batch.batch["advantages"].detach()
+        prompt_uid_t = prompt_uid.to(responses.device)
+        valid_response_mask = base_response_mask > 0
+
+        driver_rng_state = capture_driver_rng_state()
+        self._save_temp_checkpoint(folder_name=tmp_ckpt_dir)
+
+        # Full one-step baseline.
+        restore_driver_rng_state(driver_rng_state)
+        self._load_temp_checkpoint(folder_name=tmp_ckpt_dir)
+        self._single_step_update(base_batch, base_response_mask, temperature=temperature)
+        full_logprob = self.actor_rollout_wg.compute_log_prob(logprob_batch).batch["old_log_probs"].detach()
+        delta_full_map = full_logprob - policy0_logprob
+
+        bucket_defs = iter_peer_buckets()
+        summary_store: dict[tuple[int, bool, bool, int], dict[str, Any]] = {}
+        summary_meta: dict[tuple[int, bool, bool, int], dict[str, Any]] = {}
+
+        for cand_idx in tqdm(range(total_candidates), desc="causal_probe"):
+            r = int(row_idx[cand_idx])
+            c = int(col_idx[cand_idx])
+            tok = int(token_id[cand_idx])
+            prompt_id = int(prompt_uid_t[r].item())
+            target_old_logprob = float(policy0_logprob[r, c].item())
+            target_entropy = float(policy0_entropys[r, c].item())
+            target_adv = float(advantages[r, c].item())
+            delta_full = float(delta_full_map[r, c].item())
+
+            target_record_common = {
+                "checkpoint": checkpoint_id,
+                "step": int(self.global_steps),
+                "batch_id": batch_id,
+                "candidate_index": int(cand_idx),
+                "target_prompt_index": prompt_id,
+                "target_row_idx": r,
+                "target_token_position": c,
+                "target_token_id": tok,
+                "target_token_str": self._decode_token(tok),
+                "target_entropy": target_entropy,
+                "target_advantage": target_adv,
+                "target_old_logprob": target_old_logprob,
+                "delta_full": delta_full,
+                "entropy_high_threshold": entropy_threshold,
+            }
+
+            baseline_record = dict(target_record_common)
+            baseline_record.update(
+                {
+                    "record_type": "baseline",
+                    "is_same_token": None,
+                    "is_high_entropy": None,
+                    "adv_sign": None,
+                    "sample_type": "full_update",
+                    "sample_idx": 0,
+                    "peer_count": 0,
+                    "peer_pool_size": 0,
+                    "peer_indices": [],
+                    "delta_mask": None,
+                    "tau": None,
+                    "status": "ok",
+                    "skip_reason": None,
+                }
+            )
+            self._append_jsonl(result_path, baseline_record)
+
+            same_prompt_rows = prompt_uid_t == prompt_uid_t[r]
+            peer_base_mask = valid_response_mask & same_prompt_rows.unsqueeze(1)
+            peer_base_mask[r, c] = False
+            token_same_mask = responses == tok
+
+            for bucket_idx, bucket in enumerate(bucket_defs):
+                key = (
+                    cand_idx,
+                    bool(bucket["is_same_token"]),
+                    bool(bucket["is_high_entropy"]),
+                    int(bucket["adv_sign"]),
+                )
+                if key not in summary_store:
+                    summary_store[key] = {"taus": [], "skipped": 0, "total": 0}
+                    summary_meta[key] = dict(target_record_common)
+                    summary_meta[key].update(
+                        {
+                            "is_same_token": bool(bucket["is_same_token"]),
+                            "is_high_entropy": bool(bucket["is_high_entropy"]),
+                            "adv_sign": int(bucket["adv_sign"]),
+                        }
+                    )
+
+                bucket_mask = peer_base_mask.clone()
+                if bucket["is_same_token"]:
+                    bucket_mask = bucket_mask & token_same_mask
+                else:
+                    bucket_mask = bucket_mask & (~token_same_mask)
+                if bucket["is_high_entropy"]:
+                    bucket_mask = bucket_mask & is_high_entropy
+                else:
+                    bucket_mask = bucket_mask & (~is_high_entropy)
+                if int(bucket["adv_sign"]) > 0:
+                    bucket_mask = bucket_mask & (advantages > 0)
+                else:
+                    bucket_mask = bucket_mask & (advantages < 0)
+
+                peer_positions = (
+                    bucket_mask.nonzero(as_tuple=False).detach().cpu().numpy().astype(np.int64, copy=False)
+                )
+                peer_pool_size = int(peer_positions.shape[0])
+                if peer_pool_size < peer_set_size:
+                    summary_store[key]["total"] += 1
+                    summary_store[key]["skipped"] += 1
+                    skip_record = dict(target_record_common)
+                    skip_record.update(
+                        {
+                            "record_type": "masked",
+                            "is_same_token": bool(bucket["is_same_token"]),
+                            "is_high_entropy": bool(bucket["is_high_entropy"]),
+                            "adv_sign": int(bucket["adv_sign"]),
+                            "sample_type": "none",
+                            "sample_idx": -1,
+                            "peer_count": 0,
+                            "peer_pool_size": peer_pool_size,
+                            "peer_indices": [],
+                            "delta_mask": None,
+                            "tau": None,
+                            "status": "skipped",
+                            "skip_reason": f"insufficient_peers(pool={peer_pool_size}, need={peer_set_size})",
+                        }
+                    )
+                    self._append_jsonl(result_path, skip_record)
+                    continue
+
+                sample_specs: list[tuple[str, int, np.ndarray]] = []
+                random_rng = np.random.default_rng(seed + cand_idx * 1009 + bucket_idx * 9176)
+                for sample_idx in range(random_peer_set_count):
+                    choice = random_rng.choice(peer_pool_size, size=peer_set_size, replace=False)
+                    selected = peer_positions[choice]
+                    sample_specs.append(("random", sample_idx, selected))
+
+                peer_scores = score_peer_candidates(
+                    responses=responses,
+                    entropys=policy0_entropys,
+                    advantages=advantages,
+                    peer_positions=peer_positions,
+                    target_token_id=tok,
+                    score_weights=score_weights,
+                )
+                top_order = np.argsort(-peer_scores)[:peer_set_size]
+                sample_specs.append(("top_scored", 0, peer_positions[top_order]))
+
+                for sample_type, sample_idx, selected_peers in sample_specs:
+                    summary_store[key]["total"] += 1
+                    intervention_mask = valid_response_mask.clone()
+                    if selected_peers.shape[0] > 0:
+                        rr = torch.from_numpy(selected_peers[:, 0]).to(device=responses.device, dtype=torch.long)
+                        cc = torch.from_numpy(selected_peers[:, 1]).to(device=responses.device, dtype=torch.long)
+                        intervention_mask[rr, cc] = False
+                    intervention_mask[r, c] = True
+                    intervention_mask = intervention_mask.to(dtype=base_response_mask.dtype)
+
+                    restore_driver_rng_state(driver_rng_state)
+                    self._load_temp_checkpoint(folder_name=tmp_ckpt_dir)
+                    self._single_step_update(base_batch, intervention_mask, temperature=temperature)
+
+                    logprob_after = self.actor_rollout_wg.compute_log_prob(logprob_batch).batch["old_log_probs"]
+                    lp_after = float(logprob_after[r, c].item())
+                    delta_mask = lp_after - target_old_logprob
+                    tau = delta_full - delta_mask
+                    summary_store[key]["taus"].append(tau)
+
+                    record = dict(target_record_common)
+                    record.update(
+                        {
+                            "record_type": "masked",
+                            "is_same_token": bool(bucket["is_same_token"]),
+                            "is_high_entropy": bool(bucket["is_high_entropy"]),
+                            "adv_sign": int(bucket["adv_sign"]),
+                            "sample_type": sample_type,
+                            "sample_idx": int(sample_idx),
+                            "peer_count": int(selected_peers.shape[0]),
+                            "peer_pool_size": peer_pool_size,
+                            "peer_indices": selected_peers.tolist(),
+                            "delta_mask": float(delta_mask),
+                            "tau": float(tau),
+                            "status": "ok",
+                            "skip_reason": None,
+                        }
+                    )
+                    self._append_jsonl(result_path, record)
+
+        for key, stats in summary_store.items():
+            taus = np.asarray(stats["taus"], dtype=np.float64)
+            valid_n = int(taus.shape[0])
+            summary_record = dict(summary_meta[key])
+            if valid_n > 0:
+                tau_mean = float(taus.mean())
+                tau_std = float(taus.std())
+                tau_pos_ratio = float((taus > 0).mean())
+                tau_neg_ratio = float((taus < 0).mean())
+            else:
+                tau_mean = None
+                tau_std = None
+                tau_pos_ratio = None
+                tau_neg_ratio = None
+            summary_record.update(
+                {
+                    "valid_n": valid_n,
+                    "total_n": int(stats["total"]),
+                    "skipped_n": int(stats["skipped"]),
+                    "tau_mean": tau_mean,
+                    "tau_std": tau_std,
+                    "tau_pos_ratio": tau_pos_ratio,
+                    "tau_neg_ratio": tau_neg_ratio,
+                }
+            )
+            self._append_jsonl(summary_path, summary_record)
+
+        restore_driver_rng_state(driver_rng_state)
+        self._load_temp_checkpoint(folder_name=tmp_ckpt_dir)
+        print(
+            f"[INFO][causal_probe] done. raw={result_path}, summary={summary_path}, "
+            f"candidates={total_candidates}",
+            flush=True,
+        )
 
 
     def fit(self):
@@ -1026,329 +1478,9 @@ class RayPPOTrainer:
 
         causal_cfg = self.config.trainer.get("causal", {})
         if not causal_cfg.get("enable", False):
-            print("[INFO][causal] trainer.causal.enable=False, skip causal intervention run.", flush=True)
+            print("[INFO][causal_probe] trainer.causal.enable=False, skip causal probe run.", flush=True)
             return
-
-        candidates_path = causal_cfg.get("candidates_path", None)
-        if candidates_path is None:
-            raise ValueError("trainer.causal.candidates_path is required when trainer.causal.enable=True")
-        if not os.path.isabs(candidates_path):
-            candidates_path = os.path.join(os.getcwd(), candidates_path)
-
-        result_path = causal_cfg.get("result_path", None)
-        if result_path is None:
-            result_path = os.path.join(self.config.trainer.default_local_dir, "causal_results.pt")
-        if not os.path.isabs(result_path):
-            result_path = os.path.join(os.getcwd(), result_path)
-
-        random_n = int(causal_cfg.get("random_n", 64))
-        prompt_len = int(causal_cfg.get("prompt_len", 8192))
-        expected_prompt_num = causal_cfg.get("expected_prompt_num", 128)
-        expected_prompt_num = None if expected_prompt_num is None else int(expected_prompt_num)
-
-        print(f"[INFO][causal] expected_prompt_num: {expected_prompt_num}, prompt_len: {prompt_len}", flush=True)
-
-        expected_repeat = causal_cfg.get("expected_repeat_per_prompt", None)
-        if expected_repeat is None:
-            expected_repeat = self.config.actor_rollout_ref.rollout.get("n", None)
-        expected_repeat = None if expected_repeat is None else int(expected_repeat)
-
-        strategies = causal_cfg.get(
-            "strategies",
-            ["random-n", "rollout-mask-token", "prompt-mask-token-adv", "batch-mask-token-adv"],
-        )
-        if isinstance(strategies, str):
-            strategies = [strategies]
-        strategies = [str(s).lower() for s in strategies]
-
-        max_candidates = causal_cfg.get("max_candidates", None)
-        max_candidates = None if max_candidates is None else int(max_candidates)
-
-        seed = int(causal_cfg.get("seed", 42))
-        keep_candidate_grad = bool(causal_cfg.get("keep_candidate_grad", True))
-
-        tmp_ckpt_dir = causal_cfg.get("tmp_ckpt_dir", f"causal_policy0_step_{self.global_steps}")
-
-        train_iter = iter(self.train_dataloader)
-        try:
-            batch_dict = next(train_iter)
-        except StopIteration as exc:
-            raise ValueError("Train dataloader is empty, cannot run causal intervention.") from exc
-
-        normalized_batch_dict = {}
-        for key, value in batch_dict.items():
-            if hasattr(value, "shape") and value.shape[0] == 1:
-                normalized_batch_dict[key] = value[0]
-            elif isinstance(value, list) and len(value) == 1:
-                normalized_batch_dict[key] = value[0]
-            else:
-                normalized_batch_dict[key] = value
-
-        batch: DataProto = DataProto.from_single_dict(normalized_batch_dict)
-        if "response_mask" not in batch.batch:
-            if "response_masks" in batch.batch:
-                batch.batch["response_mask"] = batch.batch["response_masks"]
-            else:
-                batch.batch["response_mask"] = compute_response_mask(batch)
-
-        responses = batch.batch["responses"]
-        base_response_mask = batch.batch["response_mask"]
-        rng = torch.Generator(device=responses.device.type)
-        rng.manual_seed(seed)
-        prompt_uid = build_prompt_uid(
-            batch.batch["input_ids"],
-            prompt_len=prompt_len,
-            expected_prompt_num=expected_prompt_num,
-            expected_repeat_per_prompt=expected_repeat,
-        )
-        batch.non_tensor_batch["uid"] = prompt_uid.cpu().numpy().astype(np.int64)
-
-        print(f"[INFO][causal] load candidates from {candidates_path}", flush=True)
-        candidates = load_causal_candidates(candidates_path)
-        total_candidates = int(candidates["row_idx"].shape[0])
-        print(f"[INFO][causal] total_candidates: {total_candidates}", flush=True)
-
-        if max_candidates is not None:
-            total_candidates = min(total_candidates, max_candidates)
-            for key in list(candidates.keys()):
-                candidates[key] = candidates[key][:total_candidates]
-
-        row_idx = candidates["row_idx"]
-        col_idx = candidates["col_idx"]
-        token_id = candidates["token_id"]
-
-        if total_candidates == 0:
-            print("[INFO][causal] No candidates found, skip intervention and save empty results.", flush=True)
-            result_dir = os.path.dirname(result_path)
-            if result_dir:
-                os.makedirs(result_dir, exist_ok=True)
-            output_payload = {
-                "schema_version": "causal_intervention_result_v1",
-                "candidates_path": candidates_path,
-                "result_count": 0,
-                "seed": seed,
-                "random_n": random_n,
-                "strategies": ["baseline"] + strategies,
-                "update_api": "update_actor",
-                "results": [],
-            }
-            torch.save(output_payload, result_path)
-            print(f"[INFO][causal] saved empty results to {result_path}", flush=True)
-            return
-
-        batch_size, response_len = responses.shape
-        if np.any((row_idx < 0) | (row_idx >= batch_size)):
-            raise IndexError(f"Candidate row_idx out of range [0, {batch_size}): {row_idx}")
-        if np.any((col_idx < 0) | (col_idx >= response_len)):
-            raise IndexError(f"Candidate col_idx out of range [0, {response_len}): {col_idx}")
-
-        row_idx_t = torch.from_numpy(row_idx).to(device=responses.device, dtype=torch.long)
-        col_idx_t = torch.from_numpy(col_idx).to(device=responses.device, dtype=torch.long)
-        token_observed = responses[row_idx_t, col_idx_t].detach().cpu().numpy().astype(np.int64)
-        mismatch_idx = np.where(token_observed != token_id)[0]
-        if mismatch_idx.size > 0:
-            i = int(mismatch_idx[0])
-            raise AssertionError(
-                f"Candidate token mismatch at index {i}: "
-                f"(row={int(row_idx[i])}, col={int(col_idx[i])}) "
-                f"expected={int(token_id[i])}, observed={int(token_observed[i])}"
-            )
-
-        if "prompt_uid" in candidates:
-            prompt_uid_np = prompt_uid.detach().cpu().numpy().astype(np.int64)
-            cand_prompt_uid = candidates["prompt_uid"].astype(np.int64)
-            prompt_uid_mismatch = np.where(cand_prompt_uid != prompt_uid_np[row_idx])[0]
-            if prompt_uid_mismatch.size > 0:
-                i = int(prompt_uid_mismatch[0])
-                raise AssertionError(
-                    f"Candidate prompt_uid mismatch at index {i}: "
-                    f"candidate={int(cand_prompt_uid[i])}, recomputed={int(prompt_uid_np[row_idx[i]])}"
-                )
-
-        print(f"[INFO][causal] compute policy0 logprob", flush=True)
-        logprob_batch = batch.select(batch_keys=["input_ids", "attention_mask", "position_ids", "responses"])
-        policy0_logprob = self.actor_rollout_wg.compute_log_prob(logprob_batch).batch["old_log_probs"].detach().clone()
-
-        base_batch = deepcopy(batch)
-        # import pdb; pdb.set_trace()
-        # base_batch.batch["old_log_probs"] = policy0_logprob.clone()
-
-        # Build sparse token-level rewards from scalar outcome score, same as old commented flow:
-        # only the last valid response token receives row-level score.
-        if "token_level_rewards" not in base_batch.batch:
-            if "score" not in base_batch.non_tensor_batch:
-                raise KeyError(
-                    "Current causal GRPO flow requires non_tensor_batch['score'] to build token-level rewards."
-                )
-
-            response_mask = base_batch.batch["response_mask"]
-            scores_np = _as_numpy_1d("score", base_batch.non_tensor_batch["score"]).astype(np.float32, copy=False)
-            if scores_np.shape[0] != response_mask.shape[0]:
-                raise ValueError(
-                    f"Score length mismatch: score_len={scores_np.shape[0]}, batch_size={response_mask.shape[0]}"
-                )
-
-            scores = torch.as_tensor(scores_np, dtype=torch.float32, device=response_mask.device)
-            batch_size_local = scores.shape[0]
-            response_len_local = base_batch.batch["responses"].shape[1]
-
-            token_level_scores = torch.zeros(
-                (batch_size_local, response_len_local), dtype=scores.dtype, device=scores.device
-            )
-            seq_lengths = response_mask.sum(dim=1).long()
-            last_token_indices = (seq_lengths - 1).clamp(min=0)
-            token_level_scores[torch.arange(batch_size_local, device=scores.device), last_token_indices] = scores
-            token_level_scores = token_level_scores * response_mask
-
-            base_batch.batch["token_level_scores"] = token_level_scores
-            base_batch.batch["token_level_rewards"] = token_level_scores
-
-        norm_adv_by_std_in_grpo = bool(self.config.algorithm.get("norm_adv_by_std_in_grpo", True))
-        print(f"[INFO][causal] compute advantage with GRPO, norm_adv_by_std_in_grpo={norm_adv_by_std_in_grpo}, gamma: {self.config.algorithm.gamma}, lam: {self.config.algorithm.lam}, rollout_n: {self.config.actor_rollout_ref.rollout.n}", flush=True)
-        base_batch = compute_advantage(
-            base_batch,
-            adv_estimator=AdvantageEstimator.GRPO,
-            gamma=self.config.algorithm.gamma,
-            lam=self.config.algorithm.lam,
-            num_repeat=self.config.actor_rollout_ref.rollout.n,
-            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-            config=self.config.algorithm,
-        )
-
-        need_adv_sign = any(s in ("prompt-mask-token-adv", "batch-mask-token-adv") for s in strategies)
-        adv_sign = None
-        if need_adv_sign:
-            if "advantages" not in base_batch.batch:
-                raise KeyError("Missing `advantages` after GRPO compute_advantage.")
-            adv_sign = torch.sign(base_batch.batch["advantages"].float())
-            adv_sign = torch.where(adv_sign == 0, torch.ones_like(adv_sign), adv_sign)
-        prompt_uid_t = prompt_uid.to(responses.device)
-
-        print(
-            f"[INFO][causal] start intervention: candidates={total_candidates}, "
-            f"strategies={strategies}, keep_candidate_grad={keep_candidate_grad}, update_api=update_actor",
-            flush=True,
-        )
-
-        self._save_temp_checkpoint(folder_name=tmp_ckpt_dir)
-
-        results: list[dict[str, Any]] = []
-        all_modes = ["baseline"] + strategies
-        full_valid_tokens = int((base_response_mask > 0).sum().item())
-
-        def _to_scalar(value: Any) -> Any:
-            if isinstance(value, np.generic):
-                return value.item()
-            if torch.is_tensor(value):
-                if value.numel() == 1:
-                    return value.item()
-                return value.detach().cpu().tolist()
-            return value
-
-        def _single_step_update(mask_for_update: torch.Tensor) -> dict[str, Any]:
-            update_batch = deepcopy(base_batch)
-            update_batch.batch["response_mask"] = mask_for_update.to(dtype=base_response_mask.dtype)
-            update_batch.meta_info["temperature"] = float(causal_cfg.get("temperature", 1.0))
-            update_batch.meta_info["global_token_num"] = torch.sum(update_batch.batch["attention_mask"], dim=-1).tolist()
-
-            update_output = self.actor_rollout_wg.update_actor(update_batch)
-
-            update_metrics: dict[str, Any] = {}
-            if isinstance(update_output, DataProto):
-                metric_dict = update_output.meta_info.get("metrics", {})
-                if isinstance(metric_dict, dict):
-                    metric_dict = reduce_metrics(metric_dict)
-                    update_metrics = {k: _to_scalar(v) for k, v in metric_dict.items()}
-            return update_metrics
-
-        from tqdm import tqdm
-        for cand_idx in tqdm(range(total_candidates)):
-            r = int(row_idx[cand_idx])
-            c = int(col_idx[cand_idx])
-            tok = int(token_id[cand_idx])
-            prompt_id = int(prompt_uid_t[r].item())
-            lp0 = float(policy0_logprob[r, c].item())
-
-            candidate_meta = {}
-            for key, arr in candidates.items():
-                candidate_meta[key] = _to_scalar(arr[cand_idx])
-
-            for mode in all_modes:
-                if mode == "baseline":
-                    intervention_mask = base_response_mask.clone()
-                else:
-                    intervention_mask = get_response_mask(
-                        strategy=mode,
-                        base_response_mask=base_response_mask,
-                        responses=responses,
-                        row_idx=r,
-                        col_idx=c,
-                        token_id=tok,
-                        random_n=random_n,
-                        rng=rng,
-                        prompt_uid=prompt_uid_t,
-                        adv_sign=adv_sign,
-                        keep_candidate_grad=keep_candidate_grad,
-                    )
-
-                kept_tokens = int((intervention_mask > 0).sum().item())
-                masked_tokens = full_valid_tokens - kept_tokens
-
-                self._load_temp_checkpoint(folder_name=tmp_ckpt_dir)
-                update_metrics = _single_step_update(intervention_mask)
-                updated_logprob = self.actor_rollout_wg.compute_log_prob(logprob_batch).batch["old_log_probs"]
-                lp_after = float(updated_logprob[r, c].item())
-                delta = lp_after - lp0
-                token_adv = base_batch.batch['advantages'][r, c].item()
-
-                result = {
-                    "candidate_index": cand_idx,
-                    "strategy": mode,
-                    "keep_candidate_grad": keep_candidate_grad,
-                    # "update_api": "update_actor",
-                    "row_idx": r,
-                    "col_idx": c,
-                    "token_id": tok,
-                    "token_adv": token_adv,
-
-                    "prompt_uid": prompt_id,
-                    "policy0_logprob": lp0,
-                    "policy_after_logprob": lp_after,
-                    "delta_logprob": delta,
-                    "masked_token_num": masked_tokens,
-                    "kept_token_num": kept_tokens,
-                    "candidate_meta": candidate_meta,
-                    # "update_metrics": update_metrics,
-                }
-                results.append(result)
-
-                # save everyturn to file
-                self._write_results_append(result)
-
-                print(
-                    f"[CAUSAL] cand={cand_idx:04d} mode={mode:<24} "
-                    f"(r={r}, c={c}, tok={tok}) lp0={lp0:.6f} lp={lp_after:.6f} d={delta:+.6f} adv={token_adv:+.6f} "
-                    f"masked={masked_tokens}",
-                    flush=True,
-                )
-
-        self._load_temp_checkpoint(folder_name=tmp_ckpt_dir)
-
-        result_dir = os.path.dirname(result_path)
-        if result_dir:
-            os.makedirs(result_dir, exist_ok=True)
-        output_payload = {
-            "schema_version": "causal_intervention_result_v1",
-            "candidates_path": candidates_path,
-            "result_count": len(results),
-            "seed": seed,
-            "random_n": random_n,
-            "strategies": all_modes,
-            "update_api": "update_actor",
-            "results": results,
-        }
-        torch.save(output_payload, result_path)
-        print(f"[INFO][causal] saved results to {result_path}, count={len(results)}", flush=True)
+        self._run_offline_causal_probe(causal_cfg)
         return
 
 

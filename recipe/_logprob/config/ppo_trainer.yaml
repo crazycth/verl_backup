@@ -236,23 +236,35 @@ trainer:
     # Path to sampled candidate .pt file
     candidates_path: null
 
-    # Path to save causal intervention result .pt file
-    result_path: causal_results.pt
+    # Path to save causal probe raw result .jsonl file
+    result_path: causal_probe_results.jsonl
+
+    # Path to save per target x bucket summary .jsonl file; null -> "${result_path}.summary.jsonl"
+    summary_path: null
 
     # Temporary checkpoint directory used for policy0 reset
     tmp_ckpt_dir: causal_policy0_tmp
 
-    # Intervention strategies for each candidate token
-    strategies: ["random-n", "rollout-mask-token", "prompt-mask-token-adv", "batch-mask-token-adv"]
+    # Number of peers in each sampled peer set
+    peer_set_size: 3
 
-    # Number of random valid response tokens to mask for random-n
-    random_n: 64
+    # Number of random peer sets for each target x bucket
+    random_peer_set_count: 10
 
-    # Whether to keep the candidate token unmasked during update (True = candidate contributes gradient)
-    keep_candidate_grad: True
+    # High-entropy threshold quantile over valid response tokens (0.8 => approx top 20%)
+    entropy_high_quantile: 0.8
+
+    # Weights for deterministic top-scored peer selection proxy
+    top_score_weights:
+      same_token: 1.0
+      entropy: 1.0
+      abs_adv: 1.0
 
     # Random seed for randomized intervention
     seed: 42
+
+    # Optional free-form batch identifier stored in outputs
+    batch_id: train_batch_0
 
     # Optional cap on number of candidates for quick debugging
     max_candidates: null
