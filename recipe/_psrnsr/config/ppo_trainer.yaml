@@ -165,6 +165,23 @@ trainer:
   # Directory for logging validation data; no dump if null
   validation_data_dir: null
 
+  # Dual-update logprob dump config. When enabled, the trainer will first run an
+  # unembedding-only actor update, dump post-update logprobs, restore the actor,
+  # then run the normal actor update and dump a second set of logprobs.
+  dual_update_logprobs:
+
+    # Whether to enable the dual-update logprob dump flow
+    enable: false
+
+    # Run the dual-update flow every N training steps
+    step_interval: 1
+
+    # Directory for step-wise `.pt` dumps. Must be set when enable=true.
+    dump_dir: null
+
+    # Parameter names to keep trainable during the auxiliary update
+    unembedding_param_names: ["lm_head.weight"]
+
   # Number of nodes used in the training
   nnodes: 1
 

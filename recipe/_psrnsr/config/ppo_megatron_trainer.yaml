@@ -103,6 +103,16 @@ trainer:
   experiment_name: gsm8k
   logger: ["console", "wandb"]
   log_val_generations: 0
+
+  # Dual-update logprob dump config. When enabled, the trainer will first run an
+  # unembedding-only actor update, dump post-update logprobs, restore the actor,
+  # then run the normal actor update and dump a second set of logprobs.
+  dual_update_logprobs:
+    enable: false
+    step_interval: 1
+    dump_dir: null
+    unembedding_param_names: ["lm_head.weight"]
+
   nnodes: 1
   n_gpus_per_node: 8
   save_freq: -1

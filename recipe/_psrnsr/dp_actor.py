@@ -545,7 +545,15 @@ class DataParallelPPOActor(BasePPOActor):
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
         self.actor_module.train()
-        self.gradient_step += 1
+        count_gradient_step = data.meta_info.get("count_gradient_step", True)
+        if count_gradient_step:
+            self.gradient_step += 1
+
+        update_mode = data.meta_info.get("actor_update_mode", "normal")
+        skip_gradient_analysis = data.meta_info.get("skip_gradient_analysis", False)
+        unembedding_param_names = data.meta_info.get("unembedding_param_names", ["lm_head.weight"])
+        if isinstance(unembedding_param_names, str):
+            unembedding_param_names = [unembedding_param_names]
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
 
@@ -582,13 +590,20 @@ class DataParallelPPOActor(BasePPOActor):
 
         save_gradient = self.config.get("save_gradient", False)
         save_this_step = False
-        if save_gradient and self.gradient_step % int(self.config.get("gradient_per_step", 100000)) == 0:
+        if (
+            not skip_gradient_analysis
+            and save_gradient
+            and self.gradient_step % int(self.config.get("gradient_per_step", 100000)) == 0
+        ):
             print(f"[INFO][_psrnsr][dp_actor.py] save gradient this step", flush=True)
             save_this_step = True
 
-        print(f"[INFO][_psrnsr][dp_actor.py] on_policy here: {on_policy}, save_gradient: {save_gradient}, save_this_step: {save_this_step}", flush=True)
-
-        # import pdb; pdb.set_trace()
+        print(
+            f"[INFO][_psrnsr][dp_actor.py] update_mode={update_mode}, "
+            f"count_gradient_step={count_gradient_step}, on_policy={on_policy}, "
+            f"save_gradient={save_gradient}, save_this_step={save_this_step}",
+            flush=True,
+        )
 
         if save_this_step:
             print(f"[INFO][_psrnsr] gradient analysis for this step", flush=True)
@@ -743,8 +758,29 @@ class DataParallelPPOActor(BasePPOActor):
 
                     append_to_dict(metrics, micro_batch_metrics)
 
+                if update_mode == "unembedding_only":
+                    self._filter_gradients_by_name(unembedding_param_names)
+                    append_to_dict(
+                        metrics,
+                        {
+                            "actor/unembedding_only_mode": 1.0,
+                            "actor/unembedding_only_target_param_count": float(len(unembedding_param_names)),
+                        },
+                    )
+
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
         return metrics
+
+    def _filter_gradients_by_name(self, keep_param_names):
+        keep_param_names = set(keep_param_names)
+        named_parameters = dict(self.actor_module.named_parameters())
+        missing_param_names = sorted(keep_param_names - set(named_parameters.keys()))
+        if missing_param_names:
+            raise ValueError(f"unembedding-only update target params not found: {missing_param_names}")
+
+        for name, param in named_parameters.items():
+            if name not in keep_param_names:
+                param.grad = None

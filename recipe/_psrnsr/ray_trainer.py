@@ -70,7 +70,7 @@ from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
-from verl.utils.metric import reduce_metrics, reduce_metrics_with_key
+from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
@@ -988,6 +988,153 @@ class RayPPOTrainer:
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
+    def _to_cpu(self, value):
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu()
+        return value
+
+    def _normalize_actor_update_metrics(self, actor_output_metrics, response_token_num):
+        actor_output_metrics = dict(actor_output_metrics)
+        div_key = [
+            # Tokens beyond thresholds (irrespective of whether clipping is applied)
+            "actor-clip/pg_is_pos_ge_high_tokens_sum",
+            "actor-clip/pg_is_pos_le_low_tokens_sum",
+            "actor-clip/pg_is_neg_ge_high_tokens_sum",
+            "actor-clip/pg_is_neg_le_low_tokens_sum",
+            # Tokens actually clipped (affected by two-sided clipping switches)
+            "actor-clip/pg_clip_pos_high_tokens_sum",
+            "actor-clip/pg_clip_pos_low_tokens_sum",
+            "actor-clip/pg_clip_neg_high_tokens_sum",
+            "actor-clip/pg_clip_neg_low_tokens_sum",
+        ]
+        div_key.extend([f"actor-clip/pg_is_clip_sum_batch_{i}" for i in range(10)])
+        for key in div_key:
+            if key in actor_output_metrics:
+                actor_output_metrics[key] = actor_output_metrics[key] / response_token_num
+        actor_output_metrics["actor/response_token_num"] = response_token_num
+        return actor_output_metrics
+
+    def _prefix_metrics(self, metrics, prefix):
+        return {f"{prefix}/{key}": val for key, val in metrics.items()}
+
+    def _get_dual_update_logprob_config(self):
+        dual_update_cfg = self.config.trainer.get("dual_update_logprobs", {}) or {}
+        enable = dual_update_cfg.get("enable", self.config.trainer.get("recompute_logprob_after", False))
+        step_interval = dual_update_cfg.get("step_interval", self.config.trainer.get("recompute_logprob_step", 1))
+        if step_interval is None:
+            step_interval = 1
+        step_interval = int(step_interval)
+
+        dump_dir = dual_update_cfg.get("dump_dir", self.config.trainer.get("dump_dir", None))
+        unembedding_param_names = dual_update_cfg.get("unembedding_param_names", ["lm_head.weight"])
+        if isinstance(unembedding_param_names, str):
+            unembedding_param_names = [unembedding_param_names]
+
+        return {
+            "enable": enable,
+            "step_interval": step_interval,
+            "dump_dir": dump_dir,
+            "unembedding_param_names": list(unembedding_param_names),
+        }
+
+    def _should_run_dual_update_logprobs(self):
+        dual_update_cfg = self._get_dual_update_logprob_config()
+        if not dual_update_cfg["enable"]:
+            return False, dual_update_cfg
+
+        if dual_update_cfg["step_interval"] <= 0:
+            raise ValueError("dual_update_logprobs.step_interval must be a positive integer")
+        if dual_update_cfg["dump_dir"] is None:
+            raise ValueError("dual_update_logprobs.dump_dir must be set when dual_update_logprobs is enabled")
+
+        return self.global_steps % dual_update_cfg["step_interval"] == 0, dual_update_cfg
+
+    def _recompute_logprob_data(self, batch):
+        logprob_batch_keys = ["input_ids", "attention_mask", "position_ids", "responses"]
+        logprob_batch = batch.select(batch_keys=logprob_batch_keys)
+        logprob_after = self.actor_rollout_wg.compute_log_prob(logprob_batch)
+        return {
+            "log_probs": self._to_cpu(logprob_after.batch["old_log_probs"]),
+            "entropys": self._to_cpu(logprob_after.batch["entropys"]),
+        }
+
+    def _dump_dual_update_logprobs(self, batch, unembedding_logprob_data, normal_logprob_data, dump_dir):
+        os.makedirs(dump_dir, exist_ok=True)
+        dump_path = os.path.join(dump_dir, f"step_{self.global_steps}.pt")
+        dump_data = {
+            "global_steps": self.global_steps,
+            "input_ids": self._to_cpu(batch.batch.get("input_ids")),
+            "responses": self._to_cpu(batch.batch.get("responses")),
+            "response_mask": self._to_cpu(batch.batch.get("response_mask")),
+            "old_log_probs": self._to_cpu(batch.batch.get("old_log_probs")),
+            "uid": batch.non_tensor_batch.get("uid"),
+            "uuid": batch.non_tensor_batch.get("uuid"),
+            "score": batch.non_tensor_batch.get("score"),
+            "unembedding_logprobs_after": unembedding_logprob_data["log_probs"],
+            "unembedding_entropys_after": unembedding_logprob_data["entropys"],
+            "normal_logprobs_after": normal_logprob_data["log_probs"],
+            "normal_entropys_after": normal_logprob_data["entropys"],
+        }
+        torch.save(dump_data, dump_path)
+        print(f"[INFO][dual_update_logprobs] dumped logprobs to {dump_path}", flush=True)
+
+    def _run_dual_update_logprobs(self, batch, metrics, timing_raw):
+        dual_update_cfg = self._get_dual_update_logprob_config()
+        tmp_folder_name = os.path.join(
+            self.config.trainer.get("default_local_dir"),
+            "tmp",
+            "dual_update_logprobs",
+        )
+        response_token_num = torch.sum(batch.batch["response_mask"]).item()
+
+        self._save_temp_checkpoint(folder_name=tmp_folder_name)
+
+        unembedding_batch = copy.deepcopy(batch)
+        unembedding_batch.meta_info["multi_turn"] = False
+        unembedding_batch.meta_info["actor_update_mode"] = "unembedding_only"
+        unembedding_batch.meta_info["unembedding_param_names"] = dual_update_cfg["unembedding_param_names"]
+        unembedding_batch.meta_info["count_gradient_step"] = False
+        unembedding_batch.meta_info["skip_gradient_analysis"] = True
+        with marked_timer("update_actor_unembedding_only", timing_raw, color="red"):
+            unembedding_actor_output = self.actor_rollout_wg.update_actor(unembedding_batch)
+        unembedding_actor_metrics = reduce_metrics(unembedding_actor_output.meta_info["metrics"])
+        unembedding_actor_metrics = self._normalize_actor_update_metrics(
+            unembedding_actor_metrics, response_token_num=response_token_num
+        )
+        metrics.update(self._prefix_metrics(unembedding_actor_metrics, "dual_update/unembedding"))
+
+        with marked_timer("recompute_logprob_unembedding_only", timing_raw, color="blue"):
+            unembedding_logprob_data = self._recompute_logprob_data(unembedding_batch)
+
+        with marked_timer("restore_actor_checkpoint", timing_raw, color="blue"):
+            self._load_temp_checkpoint(folder_name=tmp_folder_name)
+
+        normal_batch = copy.deepcopy(batch)
+        normal_batch.meta_info["multi_turn"] = False
+        normal_batch.meta_info["actor_update_mode"] = "normal"
+        with marked_timer("update_actor", timing_raw, color="red"):
+            actor_output = self.actor_rollout_wg.update_actor(normal_batch)
+        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+        actor_output_metrics = self._normalize_actor_update_metrics(
+            actor_output_metrics, response_token_num=response_token_num
+        )
+        metrics.update(actor_output_metrics)
+
+        with marked_timer("recompute_logprob_normal", timing_raw, color="blue"):
+            normal_logprob_data = self._recompute_logprob_data(normal_batch)
+
+        with marked_timer("dump_dual_update_logprobs", timing_raw, color="blue"):
+            self._dump_dual_update_logprobs(
+                batch=normal_batch,
+                unembedding_logprob_data=unembedding_logprob_data,
+                normal_logprob_data=normal_logprob_data,
+                dump_dir=dual_update_cfg["dump_dir"],
+            )
+
+        metrics["dual_update/enabled"] = 1.0
+        metrics["dual_update/step_interval"] = dual_update_cfg["step_interval"]
+        return normal_batch
+
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
         if do_profile:
@@ -1544,7 +1691,6 @@ class RayPPOTrainer:
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                         entropys = old_log_prob.batch["entropys"]
-                        global_old_entropys = deepcopy(entropys)
 
                         response_masks = batch.batch["response_mask"]
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
@@ -1648,178 +1794,39 @@ class RayPPOTrainer:
                     if rollout_data_dir:
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
                     
-                    # import pdb; pdb.set_trace()
-                    # recompute logprob after update policy
-                    recompute_logprob_after = self.config.trainer.get("recompute_logprob_after", False)
-                    recompute_logprob_step = self.config.trainer.get("recompute_logprob_step")
-                    print(f"[INFO] recompute logprob after: {recompute_logprob_after}, recompute logprob step: {recompute_logprob_step}", flush=True)
-                    # import pdb; pdb.set_trace()
-                    recompute_this_step = False
-                    if recompute_logprob_after and self.global_steps % recompute_logprob_step == 0:
-                        recompute_this_step = True
-                    
-                    print(f"[INFO] global step: {self.global_steps}, recompute logprob this step: {recompute_this_step}", flush=True)
+                    run_dual_update_logprobs, dual_update_cfg = self._should_run_dual_update_logprobs()
+                    print(
+                        "[INFO] dual update logprobs: "
+                        f"enable={dual_update_cfg['enable']}, "
+                        f"step_interval={dual_update_cfg['step_interval']}, "
+                        f"run_this_step={run_dual_update_logprobs}",
+                        flush=True,
+                    )
 
-                    def to_cpu(t):
-                        if isinstance(t, torch.Tensor):
-                            return t.detach().cpu()
-                        return t
-                    
-                    def recompute_logprob(batch):
-                        logprob_batch_key = ["input_ids", "attention_mask", "position_ids", "responses"]
-                        logprob_batch = batch.select(batch_keys=logprob_batch_key)
+                    batch = compute_advantage(
+                        batch,
+                        adv_estimator=self.config.algorithm.adv_estimator,
+                        gamma=self.config.algorithm.gamma,
+                        lam=self.config.algorithm.lam,
+                        num_repeat=self.config.actor_rollout_ref.rollout.n,
+                        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                        config=self.config.algorithm,
+                    )
 
-                        # for current batch
-                        # old_logprobs = batch.batch.get("old_log_probs")
-                        # old_entropys = global_old_entropys
-                        # response_masks = batch.batch["response_mask"]
-
-                        # recompute logprobs after update
-                        logprob_after = self.actor_rollout_wg.compute_log_prob(logprob_batch)
-                        current_logprob = logprob_after.batch["old_log_probs"]
-                        current_entropys = logprob_after.batch["entropys"]
-
-                        data = {
-                            "logprob_after": to_cpu(current_logprob),
-                            "current_entropys": to_cpu(current_entropys)
-                        }
-
-                        return data
-
-                    if recompute_this_step:
-                        tmp_folder_name = self.config.trainer.get("default_local_dir")
-                        tmp_folder_name = os.path.join(tmp_folder_name, f"tmp")
-                        self._save_temp_checkpoint(folder_name=tmp_folder_name)
-
-                        # PSR Update
-                        psr_batch = copy.deepcopy(batch)
-                        psr_batch.meta_info["multi_turn"] = False
-                        psr_batch = compute_advantage(
-                            psr_batch,
-                            adv_estimator=AdvantageEstimator.GRPO,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            config=self.config.algorithm,
-                        )
-                        psr_batch, post_metrics = self.post_process(psr_batch, "posonly")
-                        psr_actor_output = self.actor_rollout_wg.update_actor(psr_batch)
-                        psr_output_metrics = reduce_metrics_with_key(psr_actor_output.meta_info["metrics"], "psr")
-                        metrics.update(psr_output_metrics)
-                        psr_logprob_data = recompute_logprob(psr_batch)
-
-                        # import pdb; pdb.set_trace()
-
-                        del psr_batch
-                        
-
-                        # NSR Update
-                        self._load_temp_checkpoint(folder_name=tmp_folder_name)
-                        nsr_batch = copy.deepcopy(batch)
-                        nsr_batch.meta_info["multi_turn"] = False
-                        nsr_batch = compute_advantage(
-                            nsr_batch,
-                            adv_estimator=AdvantageEstimator.GRPO,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            config=self.config.algorithm,
-                        )
-                        nsr_batch, post_metrics = self.post_process(nsr_batch, "negonly")
-                        nsr_actor_output = self.actor_rollout_wg.update_actor(nsr_batch)
-                        nsr_output_metrics = reduce_metrics_with_key(nsr_actor_output.meta_info["metrics"], "nsr")
-                        metrics.update(nsr_output_metrics)
-                        nsr_logprob_data = recompute_logprob(nsr_batch)
-                        
-                        del nsr_batch
-
-                        # GRPO Update
-                        self._load_temp_checkpoint(folder_name=tmp_folder_name)
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            config=self.config.algorithm,
-                        )
-                        grpo_actor_output = self.actor_rollout_wg.update_actor(batch)
-                        grpo_output_metrics = reduce_metrics(grpo_actor_output.meta_info["metrics"])
-                        metrics.update(grpo_output_metrics)
-                        grpo_logprob_data = recompute_logprob(batch)
-
-
-                        # Save LogProbs
-                        # import pdb; pdb.set_trace()
-                        dump_dir = self.config.trainer.get("dump_dir")
-                        if not os.path.exists(dump_dir):
-                            os.makedirs(dump_dir)
-                        dump_path = os.path.join(dump_dir, f"step_{self.global_steps}.pt")
-
-                        dump_data = {
-                            'input_ids': to_cpu(batch.batch.get('input_ids')),
-                            'old_log_probs': to_cpu(batch.batch.get('old_log_probs')),
-                            'response_masks': to_cpu(batch.batch.get('response_mask')),
-                            'responses': to_cpu(batch.batch.get('responses')),
-
-                            'uuid': batch.non_tensor_batch.get('uuid'),
-                            'score': batch.non_tensor_batch.get('score'),
-
-                            'psr_logprob_after': to_cpu(psr_logprob_data.get('logprob_after')),
-                            'nsr_logprob_after': to_cpu(nsr_logprob_data.get('logprob_after')),
-                            'grpo_logprob_after': to_cpu(grpo_logprob_data.get('logprob_after')),
-
-                            'psr_current_entropys': to_cpu(psr_logprob_data.get('current_entropys')),
-                            'nsr_current_entropys': to_cpu(nsr_logprob_data.get('current_entropys')),
-                            'grpo_current_entropys': to_cpu(grpo_logprob_data.get('current_entropys')),
-                        }
-                        torch.save(dump_data, dump_path)
-                        print(f"[INFO dumping data to {dump_path}]", flush=True)
-
-                        # import pdb; pdb.set_trace()
-
+                    if run_dual_update_logprobs:
+                        batch = self._run_dual_update_logprobs(batch=batch, metrics=metrics, timing_raw=timing_raw)
                     else:
-                        # use normal grpo update
-                        print(f"[INFO use noraml grpo update, step: {self.global_steps}", flush=True)
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            config=self.config.algorithm,
-                        )
+                        print(f"[INFO] use normal grpo update, step: {self.global_steps}", flush=True)
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self.actor_rollout_wg.update_actor(batch)
-                        # import pdb; pdb.set_trace()
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         response_token_num = torch.sum(batch.batch["response_mask"]).item()
-
-                        div_key = [
-                            # Tokens beyond thresholds (irrespective of whether clipping is applied)
-                            "actor-clip/pg_is_pos_ge_high_tokens_sum",
-                            "actor-clip/pg_is_pos_le_low_tokens_sum",
-                            "actor-clip/pg_is_neg_ge_high_tokens_sum",
-                            "actor-clip/pg_is_neg_le_low_tokens_sum",
-                            # Tokens actually clipped (affected by two-sided clipping switches)
-                            "actor-clip/pg_clip_pos_high_tokens_sum",
-                            "actor-clip/pg_clip_pos_low_tokens_sum",
-                            "actor-clip/pg_clip_neg_high_tokens_sum",
-                            "actor-clip/pg_clip_neg_low_tokens_sum",
-                        ]
-                        div_key.extend([f"actor-clip/pg_is_clip_sum_batch_{i}" for i in range(10)])
-                        for key in div_key:
-                            if key in actor_output_metrics:
-                                actor_output_metrics[key] = actor_output_metrics[key] / response_token_num
-                        actor_output_metrics['actor/response_token_num'] = response_token_num
-                        # import pdb; pdb.set_trace()
+                        actor_output_metrics = self._normalize_actor_update_metrics(
+                            actor_output_metrics, response_token_num=response_token_num
+                        )
                         metrics.update(actor_output_metrics)
 
-                        self._maybe_log_rollout_generations(batch, key="rollout")
+                    self._maybe_log_rollout_generations(batch, key="rollout")
 
 
                         
