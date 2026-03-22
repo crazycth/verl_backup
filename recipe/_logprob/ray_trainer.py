@@ -441,6 +441,47 @@ def iter_peer_buckets() -> list[dict[str, Any]]:
     return buckets
 
 
+def filter_peer_buckets(
+    buckets: list[dict[str, Any]],
+    *,
+    only_same_token: Optional[bool] = None,
+    only_high_entropy: Optional[bool] = None,
+    adv_signs: Optional[list[int]] = None,
+) -> list[dict[str, Any]]:
+    allowed_adv_signs = None if adv_signs is None else {int(v) for v in adv_signs}
+    filtered: list[dict[str, Any]] = []
+    for bucket in buckets:
+        if only_same_token is not None and bool(bucket["is_same_token"]) != bool(only_same_token):
+            continue
+        if only_high_entropy is not None and bool(bucket["is_high_entropy"]) != bool(only_high_entropy):
+            continue
+        if allowed_adv_signs is not None and int(bucket["adv_sign"]) not in allowed_adv_signs:
+            continue
+        filtered.append(bucket)
+    return filtered
+
+
+def build_top_scored_peer_sets(
+    peer_positions: np.ndarray,
+    peer_scores: np.ndarray,
+    *,
+    peer_set_size: int,
+    top_scored_peer_set_count: int,
+) -> list[np.ndarray]:
+    if top_scored_peer_set_count <= 0 or peer_positions.shape[0] < peer_set_size:
+        return []
+
+    ranked = peer_positions[np.argsort(-peer_scores)]
+    top_sets: list[np.ndarray] = []
+    for sample_idx in range(int(top_scored_peer_set_count)):
+        start = sample_idx * peer_set_size
+        end = start + peer_set_size
+        if end > ranked.shape[0]:
+            break
+        top_sets.append(ranked[start:end])
+    return top_sets
+
+
 def score_peer_candidates(
     responses: torch.Tensor,
     entropys: torch.Tensor,
@@ -1115,6 +1156,7 @@ class RayPPOTrainer:
 
         peer_set_size = int(causal_cfg.get("peer_set_size", 3))
         random_peer_set_count = int(causal_cfg.get("random_peer_set_count", 10))
+        top_scored_peer_set_count = int(causal_cfg.get("top_scored_peer_set_count", 1))
         entropy_high_quantile = float(causal_cfg.get("entropy_high_quantile", 0.8))
         score_weights = causal_cfg.get("top_score_weights", {})
         if not isinstance(score_weights, dict):
@@ -1130,10 +1172,21 @@ class RayPPOTrainer:
         checkpoint_id = self.config.trainer.get("resume_from_path", None)
         if checkpoint_id is None:
             checkpoint_id = "auto_latest_or_scratch"
+        only_same_token = causal_cfg.get("only_same_token", None)
+        if only_same_token is not None:
+            only_same_token = bool(only_same_token)
+        only_high_entropy = causal_cfg.get("only_high_entropy", None)
+        if only_high_entropy is not None:
+            only_high_entropy = bool(only_high_entropy)
+        adv_signs = causal_cfg.get("adv_signs", None)
+        if adv_signs is not None:
+            adv_signs = [int(v) for v in adv_signs]
 
         print(
             f"[INFO][causal_probe] start: seed={seed}, peer_set_size={peer_set_size}, "
-            f"random_peer_set_count={random_peer_set_count}, entropy_high_quantile={entropy_high_quantile}",
+            f"random_peer_set_count={random_peer_set_count}, "
+            f"top_scored_peer_set_count={top_scored_peer_set_count}, "
+            f"entropy_high_quantile={entropy_high_quantile}",
             flush=True,
         )
         print(
@@ -1250,9 +1303,16 @@ class RayPPOTrainer:
         full_logprob = self.actor_rollout_wg.compute_log_prob(logprob_batch).batch["old_log_probs"].detach()
         delta_full_map = full_logprob - policy0_logprob
 
-        bucket_defs = iter_peer_buckets()
+        bucket_defs = filter_peer_buckets(
+            iter_peer_buckets(),
+            only_same_token=only_same_token,
+            only_high_entropy=only_high_entropy,
+            adv_signs=adv_signs,
+        )
+        if len(bucket_defs) == 0:
+            raise ValueError("No peer buckets selected after applying causal bucket filters.")
         total_bucket_count = total_candidates * len(bucket_defs)
-        total_masked_max = total_bucket_count * (random_peer_set_count + 1)
+        total_masked_max = total_bucket_count * (random_peer_set_count + top_scored_peer_set_count)
         summary_store: dict[tuple[int, bool, bool, int], dict[str, Any]] = {}
         summary_meta: dict[tuple[int, bool, bool, int], dict[str, Any]] = {}
         skipped_bucket_count = 0
@@ -1428,8 +1488,14 @@ class RayPPOTrainer:
                     target_token_id=tok,
                     score_weights=score_weights,
                 )
-                top_order = np.argsort(-peer_scores)[:peer_set_size]
-                sample_specs.append(("top_scored", 0, peer_positions[top_order]))
+                top_sets = build_top_scored_peer_sets(
+                    peer_positions=peer_positions,
+                    peer_scores=peer_scores,
+                    peer_set_size=peer_set_size,
+                    top_scored_peer_set_count=top_scored_peer_set_count,
+                )
+                for sample_idx, selected_peers in enumerate(top_sets):
+                    sample_specs.append(("top_scored", sample_idx, selected_peers))
 
                 peer_pbar = tqdm(
                     sample_specs,

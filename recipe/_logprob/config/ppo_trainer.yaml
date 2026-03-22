@@ -251,8 +251,21 @@ trainer:
     # Number of random peer sets for each target x bucket
     random_peer_set_count: 10
 
+    # Number of deterministic top-scored peer sets per target x bucket.
+    # Multiple sets are taken as consecutive ranked chunks of size peer_set_size.
+    top_scored_peer_set_count: 1
+
     # High-entropy threshold quantile over valid response tokens (0.8 => approx top 20%)
     entropy_high_quantile: 0.8
+
+    # Optional bucket filters. null means keep both values.
+    only_same_token: null
+
+    # Optional bucket filters. null means keep both values.
+    only_high_entropy: null
+
+    # Optional subset of advantage signs to keep, e.g. [1, -1], [1], or [-1].
+    adv_signs: null
 
     # Weights for deterministic top-scored peer selection proxy
     top_score_weights:
