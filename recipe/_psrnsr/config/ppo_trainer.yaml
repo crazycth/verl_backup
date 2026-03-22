@@ -180,7 +180,7 @@ trainer:
     dump_dir: null
 
     # Parameter names to keep trainable during the auxiliary update
-    unembedding_param_names: ["lm_head.weight"]
+    unembedding_param_names: ["model.embed_tokens.weight"]
 
   # Number of nodes used in the training
   nnodes: 1

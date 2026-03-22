@@ -776,11 +776,21 @@ class DataParallelPPOActor(BasePPOActor):
 
     def _filter_gradients_by_name(self, keep_param_names):
         keep_param_names = set(keep_param_names)
-        named_parameters = dict(self.actor_module.named_parameters())
-        missing_param_names = sorted(keep_param_names - set(named_parameters.keys()))
+        all_named_parameters = list(self.actor_module.named_parameters(remove_duplicate=False))
+        matched_keep_params = [(name, param) for name, param in all_named_parameters if name in keep_param_names]
+        matched_keep_names = {name for name, _ in matched_keep_params}
+        missing_param_names = sorted(keep_param_names - matched_keep_names)
         if missing_param_names:
             raise ValueError(f"unembedding-only update target params not found: {missing_param_names}")
 
-        for name, param in named_parameters.items():
-            if name not in keep_param_names:
+        resolved_keep_params = {id(param) for _, param in matched_keep_params}
+        resolved_keep_names = sorted({name for name, param in self.actor_module.named_parameters() if id(param) in resolved_keep_params})
+        print(
+            f"[INFO][dp_actor] resolved unembedding-only params: requested={sorted(keep_param_names)}, "
+            f"resolved={resolved_keep_names}",
+            flush=True,
+        )
+
+        for param in self.actor_module.parameters():
+            if id(param) not in resolved_keep_params:
                 param.grad = None

@@ -1026,7 +1026,7 @@ class RayPPOTrainer:
         step_interval = int(step_interval)
 
         dump_dir = dual_update_cfg.get("dump_dir", self.config.trainer.get("dump_dir", None))
-        unembedding_param_names = dual_update_cfg.get("unembedding_param_names", ["lm_head.weight"])
+        unembedding_param_names = dual_update_cfg.get("unembedding_param_names", ["model.embed_tokens.weight"])
         if isinstance(unembedding_param_names, str):
             unembedding_param_names = [unembedding_param_names]
 

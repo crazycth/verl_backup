@@ -111,7 +111,7 @@ trainer:
     enable: false
     step_interval: 1
     dump_dir: null
-    unembedding_param_names: ["lm_head.weight"]
+    unembedding_param_names: ["model.embed_tokens.weight"]
 
   nnodes: 1
   n_gpus_per_node: 8
