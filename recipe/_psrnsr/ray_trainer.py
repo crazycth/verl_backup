@@ -70,7 +70,7 @@ from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
-from verl.utils.metric import reduce_metrics, reduce_metrics_with_key
+from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
@@ -1687,56 +1687,8 @@ class RayPPOTrainer:
                         return data
 
                     if recompute_this_step:
-                        tmp_folder_name = self.config.trainer.get("default_local_dir")
-                        tmp_folder_name = os.path.join(tmp_folder_name, f"tmp")
-                        self._save_temp_checkpoint(folder_name=tmp_folder_name)
-
-                        # PSR Update
-                        psr_batch = copy.deepcopy(batch)
-                        psr_batch.meta_info["multi_turn"] = False
-                        psr_batch = compute_advantage(
-                            psr_batch,
-                            adv_estimator=AdvantageEstimator.GRPO,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            config=self.config.algorithm,
-                        )
-                        psr_batch, post_metrics = self.post_process(psr_batch, "posonly")
-                        psr_actor_output = self.actor_rollout_wg.update_actor(psr_batch)
-                        psr_output_metrics = reduce_metrics_with_key(psr_actor_output.meta_info["metrics"], "psr")
-                        metrics.update(psr_output_metrics)
-                        psr_logprob_data = recompute_logprob(psr_batch)
-
-                        # import pdb; pdb.set_trace()
-
-                        del psr_batch
-                        
-
-                        # NSR Update
-                        self._load_temp_checkpoint(folder_name=tmp_folder_name)
-                        nsr_batch = copy.deepcopy(batch)
-                        nsr_batch.meta_info["multi_turn"] = False
-                        nsr_batch = compute_advantage(
-                            nsr_batch,
-                            adv_estimator=AdvantageEstimator.GRPO,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            config=self.config.algorithm,
-                        )
-                        nsr_batch, post_metrics = self.post_process(nsr_batch, "negonly")
-                        nsr_actor_output = self.actor_rollout_wg.update_actor(nsr_batch)
-                        nsr_output_metrics = reduce_metrics_with_key(nsr_actor_output.meta_info["metrics"], "nsr")
-                        metrics.update(nsr_output_metrics)
-                        nsr_logprob_data = recompute_logprob(nsr_batch)
-                        
-                        del nsr_batch
-
-                        # GRPO Update
-                        self._load_temp_checkpoint(folder_name=tmp_folder_name)
+                        # Run the normal GRPO update first, then recompute logprobs
+                        # against the updated actor on the same batch.
                         batch = compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
@@ -1746,9 +1698,10 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
-                        grpo_actor_output = self.actor_rollout_wg.update_actor(batch)
-                        grpo_output_metrics = reduce_metrics(grpo_actor_output.meta_info["metrics"])
-                        metrics.update(grpo_output_metrics)
+                        with marked_timer("update_actor", timing_raw, color="red"):
+                            actor_output = self.actor_rollout_wg.update_actor(batch)
+                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                        metrics.update(actor_output_metrics)
                         grpo_logprob_data = recompute_logprob(batch)
 
 
@@ -1768,12 +1721,8 @@ class RayPPOTrainer:
                             'uuid': batch.non_tensor_batch.get('uuid'),
                             'score': batch.non_tensor_batch.get('score'),
 
-                            'psr_logprob_after': to_cpu(psr_logprob_data.get('logprob_after')),
-                            'nsr_logprob_after': to_cpu(nsr_logprob_data.get('logprob_after')),
                             'grpo_logprob_after': to_cpu(grpo_logprob_data.get('logprob_after')),
 
-                            'psr_current_entropys': to_cpu(psr_logprob_data.get('current_entropys')),
-                            'nsr_current_entropys': to_cpu(nsr_logprob_data.get('current_entropys')),
                             'grpo_current_entropys': to_cpu(grpo_logprob_data.get('current_entropys')),
                         }
                         torch.save(dump_data, dump_path)
