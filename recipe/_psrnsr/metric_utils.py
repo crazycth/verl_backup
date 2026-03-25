@@ -198,6 +198,18 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     ratio_all_zeros = all_zeros_count / total_queries if total_queries > 0 else 0.0
     ratio_active_learning = mixed_count / total_queries if total_queries > 0 else 0.0
 
+    # Query-level pass rate distribution: fraction of queries with k/rollout_n correct
+    # e.g. for rollout_n=8: how many queries have 0/8, 1/8, ..., 8/8 correct rollouts
+    pass_count_distribution = defaultdict(int)
+    for u, rs in group_stats.items():
+        n_correct = sum(1 for x in rs if x > 0.5)
+        pass_count_distribution[n_correct] += 1
+
+    if total_queries > 0:
+        rollout_n = max(len(rs) for rs in group_stats.values())
+    else:
+        rollout_n = 0
+
     # pos/neg 真正训练的Token总数
     scores_np = np.array(batch.non_tensor_batch['score'])
 
@@ -267,6 +279,12 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "grpo/pos_token_cnt": pos_token_cnt,
         "grpo/neg_token_cnt": neg_token_cnt,
         "grpo/pos_neg_ratio": pos_neg_ratio,
+
+        # query-level pass rate distribution (fraction of queries with k/N correct)
+        **({
+            f"grpo/pass_dist/{k}of{rollout_n}": pass_count_distribution.get(k, 0) / total_queries
+            for k in range(rollout_n + 1)
+        } if total_queries > 0 and rollout_n > 0 else {}),
 
         # response length (non-aborted only)
         # These statistics exclude aborted samples to avoid skew from zeros
