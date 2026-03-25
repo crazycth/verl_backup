@@ -1,0 +1,150 @@
+# Code-R1 style GRPO training config for code generation with sandboxed rewards.
+# Based on _logprob config structure with code-specific overrides.
+
+defaults:
+  - actor@actor_rollout_ref.actor: dp_actor
+  - data@data: legacy_data
+  - ref@actor_rollout_ref.ref: dp_ref
+  - rollout@actor_rollout_ref.rollout: rollout
+  - model@actor_rollout_ref.model: hf_model
+  - critic@critic: dp_critic
+  - reward_model@reward_model: dp_reward_model
+  - _self_
+
+# actor/rollout/ref config
+actor_rollout_ref:
+  hybrid_engine: true
+  nccl_timeout: 600
+  rollout:
+    layered_summon: False
+    # GRPO: sample multiple responses per prompt
+    n: 16
+
+# custom reward function — not needed, "code" is registered in the global dispatcher
+custom_reward_function:
+  path: null
+  name: compute_score
+
+# GRPO algorithm config
+algorithm:
+  _target_: verl.trainer.config.AlgoConfig
+  gamma: 1.0
+  lam: 1.0
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: True
+  use_kl_in_reward: False
+  kl_penalty: low_var_kl
+  kl_ctrl:
+    _target_: verl.trainer.config.KLControlConfig
+    type: fixed
+    kl_coef: 0.001
+    horizon: 10000
+    target_kl: 0.1
+  use_pf_ppo: False
+  pf_ppo:
+    reweight_method: pow
+    weight_pow: 2.0
+  rollout_is_threshold: null
+  rollout_is_threshold_lower: null
+  rollout_is_level: token
+  rollout_is_mode: truncate
+  rollout_is_veto_threshold: 1e-4
+  rollout_is: false
+
+# code-specific data defaults
+data:
+  max_prompt_length: 2048
+  max_response_length: 4096
+
+# use prime reward manager for parallel code execution
+reward_model:
+  reward_manager: prime
+
+# trainer defaults
+trainer:
+  balance_batch: True
+  total_epochs: 8
+  total_training_steps: null
+  project_name: code-r1
+  experiment_name: coder1-grpo
+  logger: ["console", "wandb"]
+  log_val_generations: 0
+  rollout_data_dir: null
+  validation_data_dir: null
+  nnodes: 1
+  n_gpus_per_node: 8
+  save_freq: 64
+  esi_redundant_time: 0
+  resume_mode: auto
+  resume_from_path: null
+  val_before_train: True
+  val_only: False
+  test_freq: 16
+  critic_warmup: 0
+  default_hdfs_dir: null
+  del_local_ckpt_after_load: False
+  default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+  max_actor_ckpt_to_keep: null
+  max_critic_ckpt_to_keep: null
+  ray_wait_register_center_timeout: 300
+  device: cuda
+  use_legacy_worker_impl: auto
+  causal:
+    enable: False
+    candidates_path: null
+    result_path: causal_probe_results.jsonl
+    summary_path: null
+    tmp_ckpt_dir: causal_policy0_tmp
+    peer_set_size: 3
+    random_peer_set_count: 10
+    top_scored_peer_set_count: 1
+    entropy_high_quantile: 0.8
+    only_same_token: null
+    only_high_entropy: null
+    adv_signs: null
+    top_score_weights:
+      same_token: 1.0
+      entropy: 1.0
+      abs_adv: 1.0
+    seed: 42
+    batch_id: train_batch_0
+    max_candidates: null
+    prompt_len: 8192
+    expected_prompt_num: 128
+    expected_repeat_per_prompt: null
+    temperature: 1.0
+
+# profiler
+global_profiler:
+  _target_: verl.utils.profiler.ProfilerConfig
+  tool: null
+  steps: null
+  profile_continuous_steps: False
+  save_path: "outputs/profile"
+  global_tool_config:
+    nsys:
+      _target_: verl.utils.profiler.config.NsightToolConfig
+      discrete: False
+      controller_nsight_options:
+        trace: "cuda,nvtx,cublas,ucx"
+        cuda-memory-usage: "true"
+        cuda-graph-trace: "graph"
+      worker_nsight_options:
+        trace: "cuda,nvtx,cublas,ucx"
+        cuda-memory-usage: "true"
+        cuda-graph-trace: "graph"
+        capture-range: "cudaProfilerApi"
+        capture-range-end: null
+        kill: none
+    torch_memory:
+      trace_alloc_max_entries: 100_000
+      stack_depth: 32
+      context: "all"
+      stacks: "all"
+      kw_args: {}
+
+# ray config
+ray_kwargs:
+  ray_init:
+    num_cpus: null
+  timeline_json_file: null
