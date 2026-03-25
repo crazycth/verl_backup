@@ -1377,6 +1377,69 @@ class RayPPOTrainer:
             metrics["post_process/entropy/valid_token/pos"] = pos_valid_sum
             metrics["post_process/entropy/valid_token/neg"] = neg_valid_sum
 
+        elif method == "balance-posneg":
+            # Balance positive and negative rollouts to 1:1 per query.
+            # For each query (grouped by uid), keep min(n_pos, n_neg) from each side.
+            # Excess rollouts are masked out by zeroing their response_mask.
+            uids = batch.non_tensor_batch['uid']
+            scores_np = np.array(scores)
+
+            uid_to_indices = defaultdict(list)
+            for idx, uid in enumerate(uids):
+                uid_to_indices[uid].append(idx)
+
+            total_pos_kept = 0
+            total_neg_kept = 0
+            total_pos_dropped = 0
+            total_neg_dropped = 0
+            total_all_pos = 0
+            total_all_neg = 0
+            total_queries_with_both = 0
+
+            for uid, indices in uid_to_indices.items():
+                pos_indices = [i for i in indices if scores_np[i] > 0]
+                neg_indices = [i for i in indices if scores_np[i] <= 0]
+
+                n_pos = len(pos_indices)
+                n_neg = len(neg_indices)
+                total_all_pos += n_pos
+                total_all_neg += n_neg
+
+                if n_pos == 0 or n_neg == 0:
+                    # All same sign → mask out everything (no contrastive signal)
+                    for i in indices:
+                        batch.batch['response_mask'][i, :] = 0
+                    total_pos_dropped += n_pos
+                    total_neg_dropped += n_neg
+                    continue
+
+                total_queries_with_both += 1
+                keep_n = min(n_pos, n_neg)
+
+                # Keep first keep_n from each side, mask the rest
+                for i in pos_indices[:keep_n]:
+                    total_pos_kept += 1
+                for i in pos_indices[keep_n:]:
+                    batch.batch['response_mask'][i, :] = 0
+                    total_pos_dropped += 1
+
+                for i in neg_indices[:keep_n]:
+                    total_neg_kept += 1
+                for i in neg_indices[keep_n:]:
+                    batch.batch['response_mask'][i, :] = 0
+                    total_neg_dropped += 1
+
+            print(f"[INFO] balance-posneg: queries_with_both={total_queries_with_both}, "
+                  f"pos kept/dropped={total_pos_kept}/{total_pos_dropped}, "
+                  f"neg kept/dropped={total_neg_kept}/{total_neg_dropped}, "
+                  f"original pos/neg={total_all_pos}/{total_all_neg}", flush=True)
+
+            metrics["post_process/balance_posneg/queries_with_both"] = total_queries_with_both
+            metrics["post_process/balance_posneg/pos_kept"] = total_pos_kept
+            metrics["post_process/balance_posneg/neg_kept"] = total_neg_kept
+            metrics["post_process/balance_posneg/pos_dropped"] = total_pos_dropped
+            metrics["post_process/balance_posneg/neg_dropped"] = total_neg_dropped
+
         else:
             raise ValueError(f"[INFO] unknown method: {method}")
 
@@ -1616,14 +1679,13 @@ class RayPPOTrainer:
                         #     config=self.config.algorithm,
                         # )
                     
-                    # batch-post-process part
+                    # # batch-post-process part
                     # post_process = self.config.trainer.get("post_process", None)
                     # if post_process and len(post_process) > 0:
                     #     print(f"[INFO] use post_process here, method: {post_process}", flush=True)
                     #     batch, post_metrics = self.post_process(batch, post_process, entropy=global_old_entropys)
                     #     metrics.update(post_metrics)
-                    
-                    # import pdb; pdb.set_trace()
+                
 
 
                     # update critic -> False
@@ -1698,11 +1760,22 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+                        
+                        logprob_batch = copy.deepcopy(batch)
+                        
+                        # Post-process: apply after advantage computation, before actor update.
+                        post_process = self.config.trainer.get("post_process", None)
+                        if post_process and len(post_process) > 0:
+                            print(f"[INFO] use post_process here, method: {post_process}", flush=True)
+                            batch, post_metrics = self.post_process(batch, post_process, entropy=global_old_entropys)
+                            metrics.update(post_metrics)
+                            
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self.actor_rollout_wg.update_actor(batch)
+                            
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
-                        grpo_logprob_data = recompute_logprob(batch)
+                        grpo_logprob_data = recompute_logprob(logprob_batch)
 
 
                         # Save LogProbs
@@ -1728,8 +1801,6 @@ class RayPPOTrainer:
                         torch.save(dump_data, dump_path)
                         print(f"[INFO dumping data to {dump_path}]", flush=True)
 
-                        # import pdb; pdb.set_trace()
-
                     else:
                         # use normal grpo update
                         print(f"[INFO use noraml grpo update, step: {self.global_steps}", flush=True)
@@ -1742,9 +1813,17 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+
+                        # Post-process: apply after advantage computation, before actor update.
+                        post_process = self.config.trainer.get("post_process", None)
+                        if post_process and len(post_process) > 0:
+                            print(f"[INFO] use post_process here, method: {post_process}", flush=True)
+                            batch, post_metrics = self.post_process(batch, post_process, entropy=global_old_entropys)
+                            metrics.update(post_metrics)
+
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self.actor_rollout_wg.update_actor(batch)
-                        # import pdb; pdb.set_trace()
+
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         response_token_num = torch.sum(batch.batch["response_mask"]).item()
 

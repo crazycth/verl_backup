@@ -144,7 +144,9 @@ class ActorConfig(BaseConfig):
     use_token_filter: bool = False
     token_filter_method: Optional[str] = None
     entropy_top_ratio: Optional[float] = None
-    
+
+    # precise token mean
+    precise_token_mean: bool = False
 
     def __post_init__(self):
         """Validate actor configuration parameters."""

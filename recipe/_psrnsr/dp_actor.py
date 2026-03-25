@@ -611,6 +611,7 @@ class DataParallelPPOActor(BasePPOActor):
             print(f"[WARN][dp_actor] precise_token_mean is only effective with loss_agg_mode='token-mean', "
                   f"but got '{self.config.loss_agg_mode}'. Falling back to default scaling.", flush=True)
             precise_token_mean = False
+        print(f"[INFO] precise_token_mean: {precise_token_mean}", flush=True)
 
         metrics = {}
         for _ in range(self.config.ppo_epochs):
