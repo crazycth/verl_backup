@@ -606,6 +606,12 @@ class DataParallelPPOActor(BasePPOActor):
             self.actor_optimizer.zero_grad()
             print(f"[INFO][_psrnsr] gradient analysis finish", flush=True)
 
+        precise_token_mean = self.config.get("precise_token_mean", False)
+        if precise_token_mean and self.config.loss_agg_mode != "token-mean":
+            print(f"[WARN][dp_actor] precise_token_mean is only effective with loss_agg_mode='token-mean', "
+                  f"but got '{self.config.loss_agg_mode}'. Falling back to default scaling.", flush=True)
+            precise_token_mean = False
+
         metrics = {}
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
@@ -620,7 +626,11 @@ class DataParallelPPOActor(BasePPOActor):
 
                 self.actor_optimizer.zero_grad()
 
-                # import pdb; pdb.set_trace()
+                # Pre-compute total valid tokens across the entire mini_batch for precise token-mean.
+                # This lets us weight each micro_batch's gradient by its actual token share,
+                # instead of the uniform 1/N that over-weights short-response micro_batches.
+                if precise_token_mean:
+                    mini_batch_total_tokens = max(mini_batch.batch["response_mask"].sum().item(), 1.0)
 
                 print(f"[INFO][dp_actor] diff prompt size in minibatch: {len(set(mini_batch.non_tensor_batch['uid']))}", flush=True)
 
@@ -635,7 +645,13 @@ class DataParallelPPOActor(BasePPOActor):
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
 
-                    if self.config.use_dynamic_bsz:
+                    if precise_token_mean:
+                        # Precise token-mean: each micro_batch contributes proportional to its
+                        # valid token count. token_mean_i * (T_i / T_total) = token_sum_i / T_total,
+                        # so the accumulated gradient equals the exact global token-mean.
+                        micro_valid_tokens = response_mask.sum().item()
+                        loss_scale_factor = micro_valid_tokens / mini_batch_total_tokens
+                    elif self.config.use_dynamic_bsz:
                         loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
                     else:
                         loss_scale_factor = 1 / self.gradient_accumulation
