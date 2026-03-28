@@ -31,7 +31,7 @@ import torch.distributed as dist
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
 # from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
-from recipe._psrnsr.core_algos import agg_loss, get_policy_loss_fn, kl_penalty, get_global_entropy_top_mask
+from recipe._psrnsr.core_algos import agg_loss, get_policy_loss_fn, kl_penalty, get_global_entropy_top_mask, get_posneg_entropy_top_mask
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -662,10 +662,11 @@ class DataParallelPPOActor(BasePPOActor):
                     use_token_filter = self.config.get("use_token_filter", False)
                     token_filter_method = self.config.get("token_filter_method", None)
                     entropy_top_ratio = self.config.get('entropy_top_ratio', None)
+                    entropy_top_mode = self.config.get('entropy_top_mode', None)  # "global" | "posneg" | None
                     entropy_preserve = self.config.get("entropy_preserve", False)
-                    
 
-                    if entropy_coeff != 0 or use_token_filter or entropy_preserve:
+
+                    if entropy_coeff != 0 or use_token_filter or entropy_preserve or entropy_top_ratio is not None:
                         calculate_entropy = True
                     entropy, log_prob = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
@@ -675,33 +676,47 @@ class DataParallelPPOActor(BasePPOActor):
                         old_log_prob = log_prob.detach()
                     else:
                         old_log_prob = model_inputs["old_log_probs"]
-                        
 
+                    # --- Entropy Top Mask: select high-entropy tokens for policy loss ---
+                    entropy_top_mask = None
+                    if entropy_top_ratio is not None and entropy is not None:
+                        if not (0 < entropy_top_ratio <= 1):
+                            raise ValueError(f"Invalid entropy_top_ratio={entropy_top_ratio}, must be in (0, 1]")
+                        if entropy_top_mode == "posneg":
+                            # Separately select top entropy tokens within pos (adv>0) and neg (adv<0) groups
+                            entropy_top_mask = get_posneg_entropy_top_mask(
+                                entropy=entropy,
+                                response_mask=response_mask,
+                                advantages=advantages,
+                                top_ratio=entropy_top_ratio,
+                            )
+                        else:
+                            # Default: global top entropy selection across the entire micro-batch
+                            entropy_top_mask = get_global_entropy_top_mask(
+                                entropy=entropy,
+                                response_mask=response_mask,
+                                top_ratio=entropy_top_ratio,
+                            )
+
+                    # Apply entropy_top_mask: narrow response_mask to only selected tokens
+                    effective_response_mask = response_mask
+                    if entropy_top_mask is not None:
+                        effective_response_mask = response_mask * entropy_top_mask
 
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
-                    # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
 
                     # Extract pre-computed rollout importance sampling weights if present
-                    # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
                     rollout_is_weights = model_inputs.get("rollout_is_weights", None)
 
+                    print(f"[INFO] rollout_is_weights: {rollout_is_weights}, entropy_top_ratio: {entropy_top_ratio}, entropy_top_mode: {entropy_top_mode}", flush=True)
 
-                    print(f"[INFO] rollout_is_weights: {rollout_is_weights}", flush=True)
-
-                    # NOTE: Both mismatch diagnostic metrics (PPL, KL, etc.) and IS weight metrics
-                    # are computed centrally in ray_trainer.py for consistency and efficiency.
-                    # This ensures metrics are computed uniformly across all batches at the trainer level
-                    # and avoids redundant computation across workers and micro-batches.
-
-                    # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
-                    # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
 
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
                         old_log_prob=old_log_prob,
                         log_prob=log_prob,
                         advantages=advantages,
-                        response_mask=response_mask,
+                        response_mask=effective_response_mask,
                         loss_agg_mode=loss_agg_mode,
                         config=self.config,
                         rollout_is_weights=rollout_is_weights,
@@ -709,7 +724,7 @@ class DataParallelPPOActor(BasePPOActor):
                     )
 
                     if entropy_coeff != 0:
-                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=effective_response_mask, loss_agg_mode=loss_agg_mode)
 
                         # compute policy loss
                         policy_loss = pg_loss - entropy_loss * entropy_coeff
@@ -722,7 +737,7 @@ class DataParallelPPOActor(BasePPOActor):
                         kld = kl_penalty(
                             logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
                         )
-                        kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        kl_loss = agg_loss(loss_mat=kld, loss_mask=effective_response_mask, loss_agg_mode=loss_agg_mode)
 
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                         micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item() * loss_scale_factor
@@ -742,6 +757,21 @@ class DataParallelPPOActor(BasePPOActor):
                             "actor/ppo_kl": ppo_kl.detach().item(),
                         }
                     )
+
+                    # Log entropy top mask statistics
+                    if entropy_top_mask is not None:
+                        total_response_tokens = response_mask.sum().item()
+                        selected_tokens = effective_response_mask.sum().item()
+                        micro_batch_metrics["actor/entropy_top_mask/total_response_tokens"] = total_response_tokens
+                        micro_batch_metrics["actor/entropy_top_mask/selected_tokens"] = selected_tokens
+                        micro_batch_metrics["actor/entropy_top_mask/select_ratio"] = selected_tokens / max(total_response_tokens, 1)
+                        if entropy_top_mode == "posneg":
+                            pos_row_mask = (advantages * response_mask).sum(dim=1) > 0  # [B]
+                            neg_row_mask = (advantages * response_mask).sum(dim=1) < 0
+                            pos_selected = effective_response_mask[pos_row_mask].sum().item() if pos_row_mask.any() else 0
+                            neg_selected = effective_response_mask[neg_row_mask].sum().item() if neg_row_mask.any() else 0
+                            micro_batch_metrics["actor/entropy_top_mask/pos_selected_tokens"] = pos_selected
+                            micro_batch_metrics["actor/entropy_top_mask/neg_selected_tokens"] = neg_selected
                     # 4th return value may be:
                     # - a scalar tensor (legacy)
                     # - a vector tensor (older panel format)

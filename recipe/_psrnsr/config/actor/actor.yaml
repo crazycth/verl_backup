@@ -74,6 +74,15 @@ loss_agg_mode: token-mean
 # Entropy regularization coefficient in PPO loss
 entropy_coeff: 0
 
+# Fraction of top-entropy response tokens to keep for policy loss (e.g. 0.1 = top 10%).
+# null means disabled (use all response tokens).
+entropy_top_ratio: null
+
+# Mode for entropy top token selection: "global" (default) or "posneg".
+# "global": select top entropy tokens across the entire batch.
+# "posneg": select top entropy tokens separately within positive (adv>0) and negative (adv<0) groups.
+entropy_top_mode: null
+
 # Whether to use KL loss instead of KL reward penalty. True for GRPO
 use_kl_loss: false
 

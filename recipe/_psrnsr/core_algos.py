@@ -1897,4 +1897,59 @@ def get_global_entropy_top_mask(entropy, response_mask, top_ratio=0.2):
     return flat_out.view_as(entropy)
 
 
-# def get_query_entropy_top_mask(entropy, response_mask, ,top_ratio=0.2)
+def get_posneg_entropy_top_mask(entropy, response_mask, advantages, top_ratio=0.1):
+    """
+    Select the top `top_ratio` high-entropy tokens separately for positive (adv>0)
+    and negative (adv<0) samples, then merge into a single mask.
+
+    This ensures both positive and negative examples contribute high-entropy tokens
+    independently, avoiding one group dominating the selection.
+
+    Args:
+        entropy: [B, S] tensor of token entropies.
+        response_mask: [B, S] tensor (1 = response token, 0 = non-response).
+        advantages: [B, S] tensor of per-token advantages (token-level, broadcast from sequence-level).
+        top_ratio: fraction of response tokens to keep per group (e.g. 0.1 = top 10%).
+
+    Returns:
+        entropy_top_mask: [B, S] binary mask (1 = selected top entropy token)
+    """
+    B, S = entropy.shape
+    device = entropy.device
+
+    # Determine per-row advantage sign using the first valid token's advantage
+    # (advantages are typically constant across tokens within a sequence)
+    # Use mean of valid tokens per row to determine sign
+    row_adv_sum = (advantages * response_mask).sum(dim=1)  # [B]
+    pos_rows = row_adv_sum > 0  # [B] bool
+    neg_rows = row_adv_sum < 0  # [B] bool
+
+    result_mask = torch.zeros_like(entropy, dtype=torch.long)
+
+    for row_selector, label in [(pos_rows, "pos"), (neg_rows, "neg")]:
+        if row_selector.sum() == 0:
+            continue
+
+        group_entropy = entropy[row_selector]        # [G, S]
+        group_resp_mask = response_mask[row_selector] # [G, S]
+
+        flat_entropy = group_entropy.flatten()
+        flat_mask = group_resp_mask.flatten().bool()
+
+        response_entropy = flat_entropy[flat_mask]
+        if response_entropy.numel() == 0:
+            continue
+
+        top_k = max(1, int(len(response_entropy) * top_ratio + 0.9999))
+        _, topk_idx = torch.topk(response_entropy, k=top_k)
+
+        response_positions = flat_mask.nonzero(as_tuple=False).squeeze(1)
+        top_positions = response_positions[topk_idx]
+
+        flat_out = torch.zeros_like(flat_entropy, dtype=torch.long)
+        flat_out[top_positions] = 1
+        group_mask = flat_out.view_as(group_entropy)
+
+        result_mask[row_selector] = group_mask
+
+    return result_mask

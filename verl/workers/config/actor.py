@@ -144,6 +144,7 @@ class ActorConfig(BaseConfig):
     use_token_filter: bool = False
     token_filter_method: Optional[str] = None
     entropy_top_ratio: Optional[float] = None
+    entropy_top_mode: Optional[str] = None
 
     # precise token mean
     precise_token_mean: bool = False
