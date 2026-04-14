@@ -21,7 +21,6 @@ This trainer supports model-agonistic model initialization with huggingface
 import json
 import os
 import uuid
-import copy
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -1445,6 +1444,69 @@ class RayPPOTrainer:
 
         return batch, metrics
 
+    def _extract_balanced_batch(self, merged_buffer: DataProto, target_batch_size: int) -> tuple[DataProto, dict]:
+        """从 buffer 中提取固定大小的 batch。
+        少数类取 min(n_minority, max_allowed)，多数类补齐到 target_batch_size。
+        max_allowed = floor(target_batch_size * ratio_high)
+        """
+        scores = np.array(merged_buffer.non_tensor_batch['score'])
+        pos_indices = np.where(scores > 0)[0]
+        neg_indices = np.where(scores <= 0)[0]
+        n_pos, n_neg = len(pos_indices), len(neg_indices)
+
+        ratio_high = self.config.trainer.get("ratio_buffer_high", 5/8)
+        max_allowed = int(np.floor(target_batch_size * ratio_high))
+
+        info = {
+            "buffer/original_pos": n_pos,
+            "buffer/original_neg": n_neg,
+        }
+
+        # 边界情况：少数类为 0
+        if n_pos == 0 or n_neg == 0:
+            print(f"[WARNING] _extract_balanced_batch: n_pos={n_pos}, n_neg={n_neg}. "
+                  f"Using full buffer without balancing.", flush=True)
+            info["buffer/balanced_batch_size"] = n_pos + n_neg
+            info["buffer/minority_class"] = "none"
+            info["buffer/pos_take"] = n_pos
+            info["buffer/neg_take"] = n_neg
+            return merged_buffer, info
+
+        if n_pos <= n_neg:
+            minority_indices, majority_indices = pos_indices, neg_indices
+            minority_label = "pos"
+        else:
+            minority_indices, majority_indices = neg_indices, pos_indices
+            minority_label = "neg"
+
+        # 少数类：取 min(实际数量, 上界)，截断到 max_allowed
+        n_minority_take = min(len(minority_indices), max_allowed)
+        n_majority_take = target_batch_size - n_minority_take
+
+        # 如果多数类不够，尽量取全部
+        if n_majority_take > len(majority_indices):
+            print(f"[WARNING] _extract_balanced_batch: majority ({len(majority_indices)}) "
+                  f"not enough to fill {n_majority_take}. Using all majority.", flush=True)
+            n_majority_take = len(majority_indices)
+
+        rng = np.random.default_rng()
+        if n_minority_take < len(minority_indices):
+            sampled_minority = rng.choice(minority_indices, size=n_minority_take, replace=False)
+        else:
+            sampled_minority = minority_indices
+        sampled_majority = rng.choice(majority_indices, size=n_majority_take, replace=False)
+
+        selected = np.concatenate([sampled_minority, sampled_majority])
+        np.random.shuffle(selected)
+
+        balanced_batch = merged_buffer.select_idxs(selected.tolist())
+        info["buffer/balanced_batch_size"] = len(selected)
+        info["buffer/minority_class"] = minority_label
+        info["buffer/minority_take"] = n_minority_take
+        info["buffer/majority_take"] = n_majority_take
+        info["buffer/pos_take"] = n_minority_take if minority_label == "pos" else n_majority_take
+        info["buffer/neg_take"] = n_majority_take if minority_label == "pos" else n_minority_take
+        return balanced_batch, info
 
     def fit(self):
         """
@@ -1497,7 +1559,14 @@ class RayPPOTrainer:
             if self.config.global_profiler.steps is not None
             else False
         )
-        next_step_profile = False   
+        next_step_profile = False
+
+        # Ratio buffer initialization
+        ratio_low = self.config.trainer.get("ratio_buffer_low", 3/8)
+        ratio_high = self.config.trainer.get("ratio_buffer_high", 5/8)
+        max_buffer_steps = self.config.trainer.get("ratio_buffer_max_steps", 10)
+        ratio_buffer = []
+        buffer_step_count = 0
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -1518,8 +1587,6 @@ class RayPPOTrainer:
                 )
 
                 gen_batch = self._get_gen_batch(batch)
-
-                # import pdb; pdb.set_trace()
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
@@ -1558,24 +1625,17 @@ class RayPPOTrainer:
 
                             del gen_baseline_batch, gen_baseline_output
                     # repeat to align with repeated responses in rollout
-                    # import pdb; pdb.set_trace()
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
 
-                    # import pdb; pdb.set_trace()
                     batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.
-                    # NOTE: This usually changes the order of data in the `batch`,
-                    # which won't affect the advantage calculation (since it's based on uid),
-                    # but might affect the loss calculation (due to the change of mini-batching).
-                    # TODO: Decouple the DP balancing and mini-batching.
-                    if self.config.trainer.balance_batch:
+                    # For ratio buffer mode, balancing is deferred to the extracted batch.
+                    if self.config.trainer.balance_batch and not self.config.trainer.get("use_ratio_buffer", False):
                         balance_method = self.config.trainer.get("balance_method", None)
                         print(f"[INFO] balance method: {balance_method}", flush=True)
-
-                        # import pdb; pdb.set_trace()
 
                         if balance_method == "couple":
                             self._balance_batch_couple(batch, metrics=metrics)
@@ -1585,8 +1645,6 @@ class RayPPOTrainer:
                             self._balance_batch_random(batch, metrics=metrics)
                         else:
                             self._balance_batch(batch, metrics=metrics)
-                    
-                    # import pdb; pdb.set_trace()
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
@@ -1602,8 +1660,7 @@ class RayPPOTrainer:
                         else:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
-                    # import pdb; pdb.set_trace()
-                    # recompute old_log_probs
+                    # compute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                         entropys = old_log_prob.batch["entropys"]
@@ -1669,152 +1726,30 @@ class RayPPOTrainer:
                             "norm_adv_by_std_in_grpo", True
                         )  # GRPO adv normalization factor
 
-                        # batch = compute_advantage(
-                        #     batch,
-                        #     adv_estimator=self.config.algorithm.adv_estimator,
-                        #     gamma=self.config.algorithm.gamma,
-                        #     lam=self.config.algorithm.lam,
-                        #     num_repeat=self.config.actor_rollout_ref.rollout.n,
-                        #     norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                        #     config=self.config.algorithm,
-                        # )
-                    
-                    # # batch-post-process part
-                    # post_process = self.config.trainer.get("post_process", None)
-                    # if post_process and len(post_process) > 0:
-                    #     print(f"[INFO] use post_process here, method: {post_process}", flush=True)
-                    #     batch, post_metrics = self.post_process(batch, post_process, entropy=global_old_entropys)
-                    #     metrics.update(post_metrics)
-                
-
-
-                    # update critic -> False
-                    # if self.use_critic:
-                    #     with marked_timer("update_critic", timing_raw, color="pink"):
-                    #         critic_output = self.critic_wg.update_critic(batch)
-                    #     critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
-                    #     metrics.update(critic_output_metrics)
-                    
-
-                    # implement critic warmup
-                    # if self.config.trainer.critic_warmup <= self.global_steps:
-                    #     # update actor
-                    #     with marked_timer("update_actor", timing_raw, color="red"):
-                    #         batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable # False
-                    #         actor_output = self.actor_rollout_wg.update_actor(batch)
-                    #     actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                    #     metrics.update(actor_output_metrics)
+                        batch = compute_advantage(
+                            batch,
+                            adv_estimator=self.config.algorithm.adv_estimator,
+                            gamma=self.config.algorithm.gamma,
+                            lam=self.config.algorithm.lam,
+                            num_repeat=self.config.actor_rollout_ref.rollout.n,
+                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                            config=self.config.algorithm,
+                        )
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
-                    
-                    # import pdb; pdb.set_trace()
-                    # recompute logprob after update policy
-                    recompute_logprob_after = self.config.trainer.get("recompute_logprob_after", False)
-                    recompute_logprob_step = self.config.trainer.get("recompute_logprob_step")
-                    print(f"[INFO] recompute logprob after: {recompute_logprob_after}, recompute logprob step: {recompute_logprob_step}", flush=True)
-                    # import pdb; pdb.set_trace()
-                    recompute_this_step = False
-                    if recompute_logprob_after and self.global_steps % recompute_logprob_step == 0:
-                        recompute_this_step = True
-                    
-                    print(f"[INFO] global step: {self.global_steps}, recompute logprob this step: {recompute_this_step}", flush=True)
 
-                    def to_cpu(t):
-                        if isinstance(t, torch.Tensor):
-                            return t.detach().cpu()
-                        return t
-                    
-                    def recompute_logprob(batch):
-                        logprob_batch_key = ["input_ids", "attention_mask", "position_ids", "responses"]
-                        logprob_batch = batch.select(batch_keys=logprob_batch_key)
+                    # compute step-level reward mean for logging
+                    step_reward_mean = batch.batch["token_level_scores"].sum(-1).mean().item()
+                    metrics["buffer/step_reward_mean"] = step_reward_mean
 
-                        # for current batch
-                        # old_logprobs = batch.batch.get("old_log_probs")
-                        # old_entropys = global_old_entropys
-                        # response_masks = batch.batch["response_mask"]
+                    # === Ratio buffer logic ===
+                    use_ratio_buffer = self.config.trainer.get("use_ratio_buffer", False)
 
-                        # recompute logprobs after update
-                        logprob_after = self.actor_rollout_wg.compute_log_prob(logprob_batch)
-                        current_logprob = logprob_after.batch["old_log_probs"]
-                        current_entropys = logprob_after.batch["entropys"]
-
-                        data = {
-                            "logprob_after": to_cpu(current_logprob),
-                            "current_entropys": to_cpu(current_entropys)
-                        }
-
-                        return data
-
-                    if recompute_this_step:
-                        # Run the normal GRPO update first, then recompute logprobs
-                        # against the updated actor on the same batch.
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            config=self.config.algorithm,
-                        )
-                        
-                        logprob_batch = copy.deepcopy(batch)
-                        
-                        # Post-process: apply after advantage computation, before actor update.
-                        post_process = self.config.trainer.get("post_process", None)
-                        if post_process and len(post_process) > 0:
-                            print(f"[INFO] use post_process here, method: {post_process}", flush=True)
-                            batch, post_metrics = self.post_process(batch, post_process, entropy=global_old_entropys)
-                            metrics.update(post_metrics)
-                            
-                        with marked_timer("update_actor", timing_raw, color="red"):
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
-                            
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                        metrics.update(actor_output_metrics)
-                        grpo_logprob_data = recompute_logprob(logprob_batch)
-
-
-                        # Save LogProbs
-                        # import pdb; pdb.set_trace()
-                        dump_dir = self.config.trainer.get("dump_dir")
-                        if not os.path.exists(dump_dir):
-                            os.makedirs(dump_dir)
-                        dump_path = os.path.join(dump_dir, f"step_{self.global_steps}.pt")
-
-                        dump_data = {
-                            'input_ids': to_cpu(batch.batch.get('input_ids')),
-                            'old_log_probs': to_cpu(batch.batch.get('old_log_probs')),
-                            'response_masks': to_cpu(batch.batch.get('response_mask')),
-                            'responses': to_cpu(batch.batch.get('responses')),
-
-                            'uuid': batch.non_tensor_batch.get('uuid'),
-                            'score': batch.non_tensor_batch.get('score'),
-
-                            'grpo_logprob_after': to_cpu(grpo_logprob_data.get('logprob_after')),
-
-                            'grpo_current_entropys': to_cpu(grpo_logprob_data.get('current_entropys')),
-                        }
-                        torch.save(dump_data, dump_path)
-                        print(f"[INFO dumping data to {dump_path}]", flush=True)
-
-                    else:
-                        # use normal grpo update
-                        print(f"[INFO use noraml grpo update, step: {self.global_steps}", flush=True)
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            config=self.config.algorithm,
-                        )
-
-                        # Post-process: apply after advantage computation, before actor update.
+                    if not use_ratio_buffer:
+                        # --- Original path: immediate update ---
                         post_process = self.config.trainer.get("post_process", None)
                         if post_process and len(post_process) > 0:
                             print(f"[INFO] use post_process here, method: {post_process}", flush=True)
@@ -1828,12 +1763,10 @@ class RayPPOTrainer:
                         response_token_num = torch.sum(batch.batch["response_mask"]).item()
 
                         div_key = [
-                            # Tokens beyond thresholds (irrespective of whether clipping is applied)
                             "actor-clip/pg_is_pos_ge_high_tokens_sum",
                             "actor-clip/pg_is_pos_le_low_tokens_sum",
                             "actor-clip/pg_is_neg_ge_high_tokens_sum",
                             "actor-clip/pg_is_neg_le_low_tokens_sum",
-                            # Tokens actually clipped (affected by two-sided clipping switches)
                             "actor-clip/pg_clip_pos_high_tokens_sum",
                             "actor-clip/pg_clip_pos_low_tokens_sum",
                             "actor-clip/pg_clip_neg_high_tokens_sum",
@@ -1844,89 +1777,139 @@ class RayPPOTrainer:
                             if key in actor_output_metrics:
                                 actor_output_metrics[key] = actor_output_metrics[key] / response_token_num
                         actor_output_metrics['actor/response_token_num'] = response_token_num
-                        # import pdb; pdb.set_trace()
                         metrics.update(actor_output_metrics)
 
                         self._maybe_log_rollout_generations(batch, key="rollout")
 
+                    else:
+                        # --- Ratio buffer path ---
+                        # deepcopy 放入 buffer，避免后续修改 batch.meta_info 污染 buffer 中的引用
+                        buffer_batch = deepcopy(batch)
+                        # 只删除每个 step 值不同的 key，避免 concat 时冲突
+                        # 保留 temperature, micro_batch_size, use_dynamic_bsz, max_token_len 等（每个 step 相同）
+                        # metrics 由 concat 特殊处理，也保留
+                        for _k in ["global_token_num", "global_steps"]:
+                            buffer_batch.meta_info.pop(_k, None)
 
-                        
+                        ratio_buffer.append(buffer_batch)
+                        buffer_step_count += 1
 
-                    # if recompute_logprob_after:
-                        # print(f"[INFO] recompute logprob after policy update", flush=True)
-                        # import pdb; pdb.set_trace()
-                        # with marked_timer("recompute_logprob_after", timing_raw, color="blue"):
-                        #     logprob_batch_key = ["input_ids", "attention_mask", "position_ids", "responses"]
-                        #     logprob_batch = batch.select(batch_keys=logprob_batch_key)
+                        # Compute buffer-level pos/neg counts
+                        target_batch_size = self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n
+                        all_scores = np.concatenate([b.non_tensor_batch['score'] for b in ratio_buffer])
+                        pos_count = int((np.array(all_scores) > 0).sum())
+                        total_count = len(all_scores)
+                        neg_count = total_count - pos_count
+                        pos_ratio = pos_count / total_count if total_count > 0 else 0.0
 
-                        #     # for current batch
-                        #     old_logprobs = batch.batch.get("old_log_probs")
-                        #     old_entropys = global_old_entropys
-                        #     response_masks = batch.batch["response_mask"]
+                        # 判断能否构造一个大小为 target_batch_size 的合法 batch:
+                        # 从 buffer 中选出 n_pos_take 个正样本和 n_neg_take 个负样本，使得:
+                        #   n_pos_take + n_neg_take = target_batch_size
+                        #   ratio_low <= min(n_pos_take, n_neg_take) / target_batch_size <= ratio_high
+                        # 即两边各自至少有 target * ratio_low 个样本可供采样
+                        n_minority = min(pos_count, neg_count)
+                        n_majority = max(pos_count, neg_count)
+                        min_required = int(np.ceil(target_batch_size * ratio_low))
+                        max_allowed = int(np.floor(target_batch_size * ratio_high))
+                        # 少数类能提供的数量：至少 min_required，至多 min(n_minority, max_allowed)
+                        # 多数类需要补齐：target_batch_size - 少数类取的数量
+                        can_fill_batch = (
+                            n_minority >= min_required
+                            and n_majority >= (target_batch_size - max_allowed)  # 多数类至少够填 target - max_allowed
+                        )
 
-                        #     # recompute logprobs after update
-                        #     logprob_after = self.actor_rollout_wg.compute_log_prob(logprob_batch)
-                        #     current_logprob = logprob_after.batch["old_log_probs"]
-                        #     current_entropys = logprob_after.batch["entropys"]
+                        metrics["buffer/pos_count"] = pos_count
+                        metrics["buffer/neg_count"] = neg_count
+                        metrics["buffer/total_count"] = total_count
+                        metrics["buffer/pos_ratio"] = pos_ratio
+                        metrics["buffer/min_required"] = min_required
+                        metrics["buffer/max_allowed"] = max_allowed
+                        metrics["buffer/accumulation_steps"] = buffer_step_count
 
-                        #     # import pdb; pdb.set_trace()
+                        should_update = (
+                            can_fill_batch
+                            or (buffer_step_count >= max_buffer_steps)
+                            or is_last_step
+                        )
 
-                        #     # wandb log
-                        #     logprob_diff = current_logprob - old_logprobs
-                        #     logprob_diff_masked_mean = masked_mean(logprob_diff, response_masks)
+                        if not should_update:
+                            # Skip: no gradient update this step
+                            metrics["buffer/action"] = 0
+                            print(f"[INFO] step {self.global_steps}: SKIP update. "
+                                  f"pos={pos_count}, neg={neg_count}, "
+                                  f"min_required={min_required}, max_allowed={max_allowed}, "
+                                  f"buffer_steps={buffer_step_count}", flush=True)
+                        else:
+                            # Update: merge buffer, extract balanced batch, update actor
+                            metrics["buffer/action"] = 1
+                            force_reason = ""
+                            if not can_fill_batch:
+                                force_reason = f" (FORCED: buffer_steps={buffer_step_count}>={max_buffer_steps} or last_step={is_last_step})"
+                            print(f"[INFO] step {self.global_steps}: UPDATE. "
+                                  f"pos={pos_count}, neg={neg_count}, "
+                                  f"min_required={min_required}, max_allowed={max_allowed}, "
+                                  f"buffer_steps={buffer_step_count}{force_reason}", flush=True)
 
-                        #     pos_rollout_idx = batch.non_tensor_batch['score'] > 0
-                        #     neg_rollout_idx = batch.non_tensor_batch['score'] <= 0
+                            # Merge buffer
+                            merged_buffer = DataProto.concat(ratio_buffer)
 
-                        #     logprob_diff_pos = masked_mean(logprob_diff[pos_rollout_idx], response_masks[pos_rollout_idx])
-                        #     logprob_diff_neg = masked_mean(logprob_diff[neg_rollout_idx], response_masks[neg_rollout_idx])
+                            # Extract balanced batch (target = train_batch_size * rollout_n)
+                            target_batch_size = self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n
+                            train_batch, balance_info = self._extract_balanced_batch(merged_buffer, target_batch_size)
+                            metrics.update(balance_info)
 
-                        #     entropy_diff = current_entropys - old_entropys
-                        #     entropy_diff_masked_mean = masked_mean(entropy_diff, response_masks)
-                        #     pos_entropy_diff = masked_mean(entropy_diff[pos_rollout_idx], response_masks[pos_rollout_idx])
-                        #     neg_entropy_diff = masked_mean(entropy_diff[neg_rollout_idx], response_masks[neg_rollout_idx])
+                            # Post-process
+                            post_process = self.config.trainer.get("post_process", None)
+                            if post_process and len(post_process) > 0:
+                                print(f"[INFO] use post_process here, method: {post_process}", flush=True)
+                                train_batch, post_metrics = self.post_process(train_batch, post_process, entropy=None)
+                                metrics.update(post_metrics)
 
-                        #     metric_dict = {
-                        #         "dynamic/logprob_diff/mean": logprob_diff_masked_mean,
-                        #         "dynamic/logprob_diff/mean/pos": logprob_diff_pos,
-                        #         "dynamic/logprob_diff/mean/neg": logprob_diff_neg,
+                            # DP rank balancing on the final train_batch
+                            if self.config.trainer.balance_batch:
+                                balance_method = self.config.trainer.get("balance_method", None)
+                                if balance_method == "couple":
+                                    self._balance_batch_couple(train_batch, metrics=metrics)
+                                elif balance_method == "balance":
+                                    self._balance_batch_balance(train_batch, metrics=metrics)
+                                elif balance_method == "random":
+                                    self._balance_batch_random(train_batch, metrics=metrics)
+                                else:
+                                    self._balance_batch(train_batch, metrics=metrics)
 
-                        #         "dynamic/entropy_diff/mean": entropy_diff_masked_mean,
-                        #         "dynamic/entropy_diff/mean/pos": pos_entropy_diff,
-                        #         "dynamic/entropy_diff/mean/neg": neg_entropy_diff
-                        #     }
-                        #     metrics.update(metric_dict)
+                            train_batch.meta_info["global_token_num"] = torch.sum(
+                                train_batch.batch["attention_mask"], dim=-1
+                            ).tolist()
 
+                            with marked_timer("update_actor", timing_raw, color="red"):
+                                actor_output = self.actor_rollout_wg.update_actor(train_batch)
 
-                        #     # dump to local
-                        #     # import pdb; pdb.set_trace()
-                        #     dump_dir = self.config.trainer.get("dump_dir")
-                        #     if not os.path.exists(dump_dir):
-                        #         os.makedirs(dump_dir)
-                        #     dump_path = os.path.join(dump_dir, f"step_{self.global_steps}.pt")
-                        #     dump_data = {
-                        #             # --- From batch.batch (Tensors) ---
-                        #             'input_ids': to_cpu(batch.batch.get('input_ids')),
-                        #             'old_log_probs': to_cpu(batch.batch.get('old_log_probs')),
-                        #             'response_masks': to_cpu(batch.batch.get('response_mask')), # 注意代码里原本使用的是 response_mask
-                        #             'responses': to_cpu(batch.batch.get('responses')),
-                                    
-                        #             # --- From batch.non_tensor_batch (List/Meta) ---
-                        #             'uuid': batch.non_tensor_batch.get('uuid'),
-                        #             'score': batch.non_tensor_batch.get('score'),
-                                    
-                        #             # --- Computed Values ---
-                        #             # 这里保存 current_logprob，即 update 后的 logprob
-                        #             'logprob_after': to_cpu(current_logprob), 
-                        #             'old_entropys': to_cpu(old_entropys),
-                        #             'current_entropys': to_cpu(current_entropys)
-                        #         }
-                        #     print(f"[INFO] Dumping debug data to {dump_path}", flush=True)
-                        #     torch.save(dump_data, dump_path)
-                        #     # import pdb; pdb.set_trace()
+                            actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                            response_token_num = torch.sum(train_batch.batch["response_mask"]).item()
 
+                            div_key = [
+                                "actor-clip/pg_is_pos_ge_high_tokens_sum",
+                                "actor-clip/pg_is_pos_le_low_tokens_sum",
+                                "actor-clip/pg_is_neg_ge_high_tokens_sum",
+                                "actor-clip/pg_is_neg_le_low_tokens_sum",
+                                "actor-clip/pg_clip_pos_high_tokens_sum",
+                                "actor-clip/pg_clip_pos_low_tokens_sum",
+                                "actor-clip/pg_clip_neg_high_tokens_sum",
+                                "actor-clip/pg_clip_neg_low_tokens_sum",
+                            ]
+                            div_key.extend([f"actor-clip/pg_is_clip_sum_batch_{i}" for i in range(10)])
+                            for key in div_key:
+                                if key in actor_output_metrics:
+                                    actor_output_metrics[key] = actor_output_metrics[key] / response_token_num
+                            actor_output_metrics['actor/response_token_num'] = response_token_num
+                            metrics.update(actor_output_metrics)
 
+                            self._maybe_log_rollout_generations(train_batch, key="rollout")
 
+                            # Clear buffer
+                            ratio_buffer = []
+                            buffer_step_count = 0
+                            del merged_buffer, train_batch
 
                 # validate
                 if (
@@ -1985,6 +1968,8 @@ class RayPPOTrainer:
                     }
                 )
                 # collect metrics
+                if "global_token_num" not in batch.meta_info:
+                    batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo

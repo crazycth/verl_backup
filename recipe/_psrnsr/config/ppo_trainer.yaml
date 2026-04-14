@@ -141,6 +141,18 @@ trainer:
   # Whether to balance batch sizes across distributed workers
   balance_batch: True
 
+  # Whether to enable ratio buffer mechanism for controlling pos/neg sample ratio
+  use_ratio_buffer: False
+
+  # Lower bound of acceptable positive-sample ratio in buffer (default 3/8)
+  ratio_buffer_low: 0.375
+
+  # Upper bound of acceptable positive-sample ratio in buffer (default 5/8)
+  ratio_buffer_high: 0.625
+
+  # Maximum number of accumulation steps before forcing a gradient update (safety valve)
+  ratio_buffer_max_steps: 10
+
   # Number of epochs in training
   total_epochs: 30
 
