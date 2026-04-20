@@ -1508,6 +1508,101 @@ class RayPPOTrainer:
         info["buffer/neg_take"] = n_majority_take if minority_label == "pos" else n_minority_take
         return balanced_batch, info
 
+    def _per_sample_abs_advantage(self, data: DataProto) -> np.ndarray:
+        """Return a 1D numpy array of length B giving each sample's |advantage|,
+        defined as |mean advantage over the response tokens| with response_mask
+        weighting. For GRPO this collapses to the per-sample scalar advantage
+        (all tokens share the same value)."""
+        adv = data.batch["advantages"]               # (B, T)
+        mask = data.batch["response_mask"].to(adv.dtype)   # (B, T)
+        denom = mask.sum(dim=-1).clamp(min=1.0)
+        mean_adv = (adv * mask).sum(dim=-1) / denom  # (B,)
+        return mean_adv.abs().detach().cpu().numpy()
+
+    def _extract_dynamic_balanced_batch(
+        self,
+        merged_buffer: DataProto,
+        n_each: int,
+    ) -> tuple[DataProto, dict]:
+        """Dynamic 1:1 balanced extraction.
+
+        Take exactly `n_each` positives and `n_each` negatives from the buffer,
+        prioritising samples with the LARGEST |advantage| within each class.
+        Final batch size = 2 * n_each.
+
+        Falls back gracefully if one side does not have enough samples (will
+        take all of the short side and match with as many from the other side
+        as possible, logging the deficit).
+        """
+        scores = np.asarray(merged_buffer.non_tensor_batch['score'])
+        pos_indices = np.where(scores > 0)[0]
+        neg_indices = np.where(scores <= 0)[0]
+        n_pos, n_neg = len(pos_indices), len(neg_indices)
+
+        info = {
+            "buffer/original_pos": n_pos,
+            "buffer/original_neg": n_neg,
+            "buffer/requested_n_each": n_each,
+        }
+
+        # Edge case: one side is empty -> return all we have, skip balancing.
+        if n_pos == 0 or n_neg == 0:
+            print(
+                f"[WARNING] _extract_dynamic_balanced_batch: n_pos={n_pos}, "
+                f"n_neg={n_neg}. Returning full buffer un-balanced.", flush=True
+            )
+            info["buffer/balanced_batch_size"] = n_pos + n_neg
+            info["buffer/pos_take"] = n_pos
+            info["buffer/neg_take"] = n_neg
+            info["buffer/minority_class"] = "none"
+            return merged_buffer, info
+
+        abs_adv = self._per_sample_abs_advantage(merged_buffer)
+
+        # Priority-select: for each class, sort its samples by |adv| desc and
+        # take the top-k (k clipped to available count).
+        def _topk_by_abs_adv(idx_array, k):
+            if k <= 0 or len(idx_array) == 0:
+                return np.empty(0, dtype=np.int64)
+            k_eff = min(k, len(idx_array))
+            sub_abs = abs_adv[idx_array]
+            # argsort ascending, then reverse; stable to make behavior deterministic.
+            order = np.argsort(-sub_abs, kind="stable")
+            return idx_array[order[:k_eff]]
+
+        pos_take = _topk_by_abs_adv(pos_indices, n_each)
+        neg_take = _topk_by_abs_adv(neg_indices, n_each)
+
+        # If one side is short, we keep 1:1 by taking `min(n_pos, n_neg, n_each)`
+        # from each side.
+        actual_each = min(len(pos_take), len(neg_take))
+        if actual_each < n_each:
+            print(
+                f"[WARNING] _extract_dynamic_balanced_batch: requested {n_each} "
+                f"per side but only got pos={len(pos_take)}, neg={len(neg_take)}. "
+                f"Using {actual_each} per side to keep 1:1.", flush=True
+            )
+            pos_take = pos_take[:actual_each]
+            neg_take = neg_take[:actual_each]
+
+        selected = np.concatenate([pos_take, neg_take])
+        np.random.shuffle(selected)
+
+        balanced_batch = merged_buffer.select_idxs(selected.tolist())
+        info["buffer/balanced_batch_size"] = int(len(selected))
+        info["buffer/pos_take"] = int(len(pos_take))
+        info["buffer/neg_take"] = int(len(neg_take))
+        info["buffer/minority_class"] = (
+            "pos" if n_pos <= n_neg else "neg"
+        )
+        info["buffer/abs_adv_pos_taken_mean"] = (
+            float(abs_adv[pos_take].mean()) if len(pos_take) else 0.0
+        )
+        info["buffer/abs_adv_neg_taken_mean"] = (
+            float(abs_adv[neg_take].mean()) if len(neg_take) else 0.0
+        )
+        return balanced_batch, info
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1565,6 +1660,128 @@ class RayPPOTrainer:
         ratio_low = self.config.trainer.get("ratio_buffer_low", 3/8)
         ratio_high = self.config.trainer.get("ratio_buffer_high", 5/8)
         max_buffer_steps = self.config.trainer.get("ratio_buffer_max_steps", 10)
+
+        # Dynamic buffer (new): 1:1 pos/neg with a variable batch size in the
+        # range [dynamic_buffer_low, dynamic_buffer_high]. When both knobs are
+        # set (i.e. not None), this path replaces the fixed-size ratio_buffer.
+        #
+        # Constraint: every update must split into exactly N_MINI per DP rank
+        # (default N_MINI=4), so the global batch must be divisible by
+        # dp_size * N_MINI. The per-DP mini-batch size is computed at runtime
+        # and passed to dp_actor.update_policy via meta_info.
+        dyn_buffer_low = self.config.trainer.get("dynamic_buffer_low", None)
+        dyn_buffer_high = self.config.trainer.get("dynamic_buffer_high", None)
+        use_dynamic_buffer = (dyn_buffer_low is not None) and (dyn_buffer_high is not None)
+        if use_dynamic_buffer:
+            dyn_buffer_low = int(dyn_buffer_low)
+            dyn_buffer_high = int(dyn_buffer_high)
+            # number of mini-batches per DP rank per update
+            dyn_n_mini = int(self.config.trainer.get("dynamic_buffer_n_mini", 4))
+            # global GPU world size; dp_size = world / sp_size
+            world_size = self.actor_rollout_wg.world_size
+            sp_size_cfg = int(
+                self.config.actor_rollout_ref.actor.get("ulysses_sequence_parallel_size", 1)
+            )
+            dp_size = world_size // sp_size_cfg
+            # ALIGN = dp_size * n_mini  → global batch must be a multiple of this.
+            # Also batch must be a multiple of 2 (1:1 pos/neg). LCM handles that.
+            from math import gcd
+            def _lcm(a, b):
+                return a * b // gcd(a, b)
+            dyn_align = _lcm(2, dp_size * dyn_n_mini)
+
+            assert dyn_buffer_low <= dyn_buffer_high, (
+                f"dynamic_buffer_low ({dyn_buffer_low}) must be <= "
+                f"dynamic_buffer_high ({dyn_buffer_high})"
+            )
+            # Snap [low, high] to alignment: low rounds UP, high rounds DOWN.
+            new_low = ((dyn_buffer_low + dyn_align - 1) // dyn_align) * dyn_align
+            new_high = (dyn_buffer_high // dyn_align) * dyn_align
+            if new_low != dyn_buffer_low:
+                print(
+                    f"[WARN] dynamic_buffer_low={dyn_buffer_low} is not a "
+                    f"multiple of align={dyn_align} (=dp_size*{dyn_n_mini}). "
+                    f"Rounding UP to {new_low}.",
+                    flush=True,
+                )
+                dyn_buffer_low = new_low
+            if new_high != dyn_buffer_high:
+                print(
+                    f"[WARN] dynamic_buffer_high={dyn_buffer_high} is not a "
+                    f"multiple of align={dyn_align}. Rounding DOWN to {new_high}.",
+                    flush=True,
+                )
+                dyn_buffer_high = new_high
+            assert dyn_buffer_low <= dyn_buffer_high, (
+                f"After alignment, dyn_buffer_low ({dyn_buffer_low}) > "
+                f"dyn_buffer_high ({dyn_buffer_high}). Increase dyn_buffer_high "
+                f"or reduce dp_size*n_mini."
+            )
+            assert dyn_buffer_low >= dyn_align, (
+                f"dyn_buffer_low ({dyn_buffer_low}) must be >= align "
+                f"({dyn_align}); otherwise no valid batch size exists."
+            )
+            print(
+                f"[INFO] dynamic_buffer enabled: low={dyn_buffer_low}, "
+                f"high={dyn_buffer_high}, dp_size={dp_size}, n_mini={dyn_n_mini}, "
+                f"align={dyn_align}",
+                flush=True,
+            )
+
+            # ---- alignment constraint ----
+            # The final batch must be divisible by (ppo_mini_batch_size * rollout_n)
+            # so that when worker code runs
+            #     self.config.ppo_mini_batch_size *= rollout_n
+            #     self.config.ppo_mini_batch_size //= (world_size // sp_size)
+            #     data.split(self.config.ppo_mini_batch_size)   # in dp_actor.update_policy
+            # every DP rank gets an integer number of mini-batches of identical
+            # size. (Derivation: per-DP batch = global/dp_size; per-DP mini =
+            # ppo_mini_batch_size * rollout_n / dp_size; therefore global batch
+            # must be a multiple of ppo_mini_batch_size * rollout_n.)
+            dyn_align = int(
+                self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+                * self.config.actor_rollout_ref.rollout.n
+            )
+            # Both dyn_low and dyn_high should themselves be multiples of
+            # dyn_align (else the user's intent is under-specified).
+            if dyn_buffer_high % dyn_align != 0:
+                # auto-round high DOWN to nearest multiple of dyn_align
+                new_high = (dyn_buffer_high // dyn_align) * dyn_align
+                print(
+                    f"[WARN] dynamic_buffer_high={dyn_buffer_high} is not a "
+                    f"multiple of ppo_mini_batch_size*rollout_n={dyn_align}. "
+                    f"Rounding down to {new_high}.",
+                    flush=True,
+                )
+                dyn_buffer_high = new_high
+            if dyn_buffer_low % dyn_align != 0:
+                # auto-round low UP to nearest multiple of dyn_align (so any
+                # batch that clears the trigger will produce a valid aligned
+                # batch of size >= dyn_buffer_low after floor-alignment)
+                new_low = ((dyn_buffer_low + dyn_align - 1) // dyn_align) * dyn_align
+                print(
+                    f"[WARN] dynamic_buffer_low={dyn_buffer_low} is not a "
+                    f"multiple of ppo_mini_batch_size*rollout_n={dyn_align}. "
+                    f"Rounding up to {new_low}.",
+                    flush=True,
+                )
+                dyn_buffer_low = new_low
+            assert dyn_buffer_low <= dyn_buffer_high, (
+                f"After alignment, dyn_buffer_low ({dyn_buffer_low}) exceeds "
+                f"dyn_buffer_high ({dyn_buffer_high}). Increase dyn_buffer_high or "
+                f"decrease dyn_buffer_low / ppo_mini_batch_size."
+            )
+            assert dyn_buffer_low >= dyn_align, (
+                f"dyn_buffer_low ({dyn_buffer_low}) must be >= "
+                f"ppo_mini_batch_size*rollout_n ({dyn_align}) so that at least "
+                f"one mini-batch can be formed."
+            )
+            print(
+                f"[INFO] dynamic_buffer enabled: low={dyn_buffer_low}, "
+                f"high={dyn_buffer_high}, align={dyn_align}",
+                flush=True,
+            )
+
         ratio_buffer = []
         buffer_step_count = 0
 
@@ -1794,122 +2011,276 @@ class RayPPOTrainer:
                         ratio_buffer.append(buffer_batch)
                         buffer_step_count += 1
 
-                        # Compute buffer-level pos/neg counts
-                        target_batch_size = self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n
                         all_scores = np.concatenate([b.non_tensor_batch['score'] for b in ratio_buffer])
                         pos_count = int((np.array(all_scores) > 0).sum())
                         total_count = len(all_scores)
                         neg_count = total_count - pos_count
                         pos_ratio = pos_count / total_count if total_count > 0 else 0.0
 
-                        # 判断能否构造一个大小为 target_batch_size 的合法 batch:
-                        # 从 buffer 中选出 n_pos_take 个正样本和 n_neg_take 个负样本，使得:
-                        #   n_pos_take + n_neg_take = target_batch_size
-                        #   ratio_low <= min(n_pos_take, n_neg_take) / target_batch_size <= ratio_high
-                        # 即两边各自至少有 target * ratio_low 个样本可供采样
-                        n_minority = min(pos_count, neg_count)
-                        n_majority = max(pos_count, neg_count)
-                        min_required = int(np.ceil(target_batch_size * ratio_low))
-                        max_allowed = int(np.floor(target_batch_size * ratio_high))
-                        # 少数类能提供的数量：至少 min_required，至多 min(n_minority, max_allowed)
-                        # 多数类需要补齐：target_batch_size - 少数类取的数量
-                        can_fill_batch = (
-                            n_minority >= min_required
-                            and n_majority >= (target_batch_size - max_allowed)  # 多数类至少够填 target - max_allowed
-                        )
+                        if use_dynamic_buffer:
+                            # ---------- DYNAMIC 1:1 buffer ----------
+                            # Rules:
+                            #   1. final_batch % dyn_align == 0   (dp_size * n_mini)
+                            #   2. dyn_buffer_low <= final_batch <= dyn_buffer_high
+                            #   3. final_batch == 2 * n_each (1:1 pos/neg)
+                            #   4. n_each <= min(pos_count, neg_count)
+                            #
+                            # Trigger: we can *after alignment* produce a batch
+                            # of size >= dyn_buffer_low. Since dyn_buffer_low is
+                            # already aligned to dyn_align, this requires
+                            #   min(pos_count, neg_count) * 2 >= dyn_buffer_low
+                            # i.e. each side has at least dyn_buffer_low / 2.
+                            half_low = dyn_buffer_low // 2
+                            half_high = dyn_buffer_high // 2
+                            can_fill_batch = (pos_count >= half_low and neg_count >= half_low)
 
-                        metrics["buffer/pos_count"] = pos_count
-                        metrics["buffer/neg_count"] = neg_count
-                        metrics["buffer/total_count"] = total_count
-                        metrics["buffer/pos_ratio"] = pos_ratio
-                        metrics["buffer/min_required"] = min_required
-                        metrics["buffer/max_allowed"] = max_allowed
-                        metrics["buffer/accumulation_steps"] = buffer_step_count
+                            # Pick the largest aligned batch that fits.
+                            n_each_raw = min(pos_count, neg_count, half_high)
+                            final_batch = (2 * n_each_raw // dyn_align) * dyn_align
+                            # Safety: clamp to [dyn_align, dyn_buffer_high]
+                            if final_batch > dyn_buffer_high:
+                                final_batch = (dyn_buffer_high // dyn_align) * dyn_align
+                            n_each = final_batch // 2
 
-                        should_update = (
-                            can_fill_batch
-                            or (buffer_step_count >= max_buffer_steps)
-                            or is_last_step
-                        )
+                            # Per-DP mini-batch size: final_batch / dp_size / n_mini
+                            per_dp_batch = final_batch // dp_size
+                            per_dp_mini = per_dp_batch // dyn_n_mini
 
-                        if not should_update:
-                            # Skip: no gradient update this step
-                            metrics["buffer/action"] = 0
-                            print(f"[INFO] step {self.global_steps}: SKIP update. "
-                                  f"pos={pos_count}, neg={neg_count}, "
-                                  f"min_required={min_required}, max_allowed={max_allowed}, "
-                                  f"buffer_steps={buffer_step_count}", flush=True)
+                            metrics["buffer/pos_count"] = pos_count
+                            metrics["buffer/neg_count"] = neg_count
+                            metrics["buffer/total_count"] = total_count
+                            metrics["buffer/pos_ratio"] = pos_ratio
+                            metrics["buffer/dyn_low"] = dyn_buffer_low
+                            metrics["buffer/dyn_high"] = dyn_buffer_high
+                            metrics["buffer/dyn_align"] = dyn_align
+                            metrics["buffer/planned_batch_size"] = final_batch
+                            metrics["buffer/planned_per_dp_mini"] = per_dp_mini
+                            metrics["buffer/accumulation_steps"] = buffer_step_count
+
+                            should_update = (
+                                can_fill_batch
+                                or (buffer_step_count >= max_buffer_steps)
+                                or is_last_step
+                            )
+
+                            if not should_update:
+                                metrics["buffer/action"] = 0
+                                print(
+                                    f"[INFO] step {self.global_steps}: SKIP update (dyn). "
+                                    f"pos={pos_count}, neg={neg_count}, "
+                                    f"need>={half_low}/side, buffer_steps={buffer_step_count}",
+                                    flush=True,
+                                )
+                            elif final_batch < dyn_align:
+                                # Forced update but we don't have even a single
+                                # aligned batch's worth. Keep accumulating and
+                                # log a warning rather than crash.
+                                metrics["buffer/action"] = 0
+                                print(
+                                    f"[WARN] step {self.global_steps}: would update but "
+                                    f"final_batch={final_batch} < align={dyn_align}. "
+                                    f"Continuing to accumulate (this can happen in extreme "
+                                    f"skew; will unblock once min(pos,neg) >= {dyn_align//2}).",
+                                    flush=True,
+                                )
+                            else:
+                                metrics["buffer/action"] = 1
+                                force_reason = ""
+                                if not can_fill_batch:
+                                    force_reason = (
+                                        f" (FORCED: buffer_steps={buffer_step_count}>={max_buffer_steps} "
+                                        f"or last_step={is_last_step})"
+                                    )
+                                print(
+                                    f"[INFO] step {self.global_steps}: UPDATE (dyn). "
+                                    f"pos={pos_count}, neg={neg_count}, "
+                                    f"n_each={n_each}, batch_size={final_batch}, "
+                                    f"per_dp_mini={per_dp_mini}, "
+                                    f"buffer_steps={buffer_step_count}{force_reason}",
+                                    flush=True,
+                                )
+
+                                merged_buffer = DataProto.concat(ratio_buffer)
+                                train_batch, balance_info = self._extract_dynamic_balanced_batch(
+                                    merged_buffer, n_each=n_each
+                                )
+                                metrics.update(balance_info)
+
+                                # --- the rest of the update path is identical ---
+                                post_process = self.config.trainer.get("post_process", None)
+                                if post_process and len(post_process) > 0:
+                                    print(f"[INFO] use post_process here, method: {post_process}", flush=True)
+                                    train_batch, post_metrics = self.post_process(train_batch, post_process, entropy=None)
+                                    metrics.update(post_metrics)
+
+                                if self.config.trainer.balance_batch:
+                                    balance_method = self.config.trainer.get("balance_method", None)
+                                    if balance_method == "couple":
+                                        self._balance_batch_couple(train_batch, metrics=metrics)
+                                    elif balance_method == "balance":
+                                        self._balance_batch_balance(train_batch, metrics=metrics)
+                                    elif balance_method == "random":
+                                        self._balance_batch_random(train_batch, metrics=metrics)
+                                    else:
+                                        self._balance_batch(train_batch, metrics=metrics)
+
+                                train_batch.meta_info["global_token_num"] = torch.sum(
+                                    train_batch.batch["attention_mask"], dim=-1
+                                ).tolist()
+                                # Tell dp_actor the per-DP mini-batch size for this step.
+                                train_batch.meta_info["runtime_ppo_mini_batch_size_per_dp"] = int(per_dp_mini)
+
+                                with marked_timer("update_actor", timing_raw, color="red"):
+                                    actor_output = self.actor_rollout_wg.update_actor(train_batch)
+
+                                actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                                response_token_num = torch.sum(train_batch.batch["response_mask"]).item()
+
+                                div_key = [
+                                    "actor-clip/pg_is_pos_ge_high_tokens_sum",
+                                    "actor-clip/pg_is_pos_le_low_tokens_sum",
+                                    "actor-clip/pg_is_neg_ge_high_tokens_sum",
+                                    "actor-clip/pg_is_neg_le_low_tokens_sum",
+                                    "actor-clip/pg_clip_pos_high_tokens_sum",
+                                    "actor-clip/pg_clip_pos_low_tokens_sum",
+                                    "actor-clip/pg_clip_neg_high_tokens_sum",
+                                    "actor-clip/pg_clip_neg_low_tokens_sum",
+                                ]
+                                div_key.extend([f"actor-clip/pg_is_clip_sum_batch_{i}" for i in range(10)])
+                                for key in div_key:
+                                    if key in actor_output_metrics:
+                                        actor_output_metrics[key] = actor_output_metrics[key] / response_token_num
+                                actor_output_metrics['actor/response_token_num'] = response_token_num
+                                metrics.update(actor_output_metrics)
+
+                                self._maybe_log_rollout_generations(train_batch, key="rollout")
+
+                                ratio_buffer = []
+                                buffer_step_count = 0
+                                del merged_buffer, train_batch
+
+                            # done with dynamic-buffer branch; skip the fixed-size
+                            # branch below
+                            continue_dyn = True
                         else:
-                            # Update: merge buffer, extract balanced batch, update actor
-                            metrics["buffer/action"] = 1
-                            force_reason = ""
-                            if not can_fill_batch:
-                                force_reason = f" (FORCED: buffer_steps={buffer_step_count}>={max_buffer_steps} or last_step={is_last_step})"
-                            print(f"[INFO] step {self.global_steps}: UPDATE. "
-                                  f"pos={pos_count}, neg={neg_count}, "
-                                  f"min_required={min_required}, max_allowed={max_allowed}, "
-                                  f"buffer_steps={buffer_step_count}{force_reason}", flush=True)
+                            continue_dyn = False
 
-                            # Merge buffer
-                            merged_buffer = DataProto.concat(ratio_buffer)
-
-                            # Extract balanced batch (target = train_batch_size * rollout_n)
+                        if continue_dyn:
+                            # already handled above
+                            pass
+                        else:
+                            # ---------- FIXED-SIZE ratio buffer (legacy) ----------
+                            # Compute buffer-level pos/neg counts
                             target_batch_size = self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n
-                            train_batch, balance_info = self._extract_balanced_batch(merged_buffer, target_batch_size)
-                            metrics.update(balance_info)
 
-                            # Post-process
-                            post_process = self.config.trainer.get("post_process", None)
-                            if post_process and len(post_process) > 0:
-                                print(f"[INFO] use post_process here, method: {post_process}", flush=True)
-                                train_batch, post_metrics = self.post_process(train_batch, post_process, entropy=None)
-                                metrics.update(post_metrics)
+                            # 判断能否构造一个大小为 target_batch_size 的合法 batch:
+                            # 从 buffer 中选出 n_pos_take 个正样本和 n_neg_take 个负样本，使得:
+                            #   n_pos_take + n_neg_take = target_batch_size
+                            #   ratio_low <= min(n_pos_take, n_neg_take) / target_batch_size <= ratio_high
+                            # 即两边各自至少有 target * ratio_low 个样本可供采样
+                            n_minority = min(pos_count, neg_count)
+                            n_majority = max(pos_count, neg_count)
+                            min_required = int(np.ceil(target_batch_size * ratio_low))
+                            max_allowed = int(np.floor(target_batch_size * ratio_high))
+                            # 少数类能提供的数量：至少 min_required，至多 min(n_minority, max_allowed)
+                            # 多数类需要补齐：target_batch_size - 少数类取的数量
+                            can_fill_batch = (
+                                n_minority >= min_required
+                                and n_majority >= (target_batch_size - max_allowed)  # 多数类至少够填 target - max_allowed
+                            )
 
-                            # DP rank balancing on the final train_batch
-                            if self.config.trainer.balance_batch:
-                                balance_method = self.config.trainer.get("balance_method", None)
-                                if balance_method == "couple":
-                                    self._balance_batch_couple(train_batch, metrics=metrics)
-                                elif balance_method == "balance":
-                                    self._balance_batch_balance(train_batch, metrics=metrics)
-                                elif balance_method == "random":
-                                    self._balance_batch_random(train_batch, metrics=metrics)
-                                else:
-                                    self._balance_batch(train_batch, metrics=metrics)
+                            metrics["buffer/pos_count"] = pos_count
+                            metrics["buffer/neg_count"] = neg_count
+                            metrics["buffer/total_count"] = total_count
+                            metrics["buffer/pos_ratio"] = pos_ratio
+                            metrics["buffer/min_required"] = min_required
+                            metrics["buffer/max_allowed"] = max_allowed
+                            metrics["buffer/accumulation_steps"] = buffer_step_count
 
-                            train_batch.meta_info["global_token_num"] = torch.sum(
-                                train_batch.batch["attention_mask"], dim=-1
-                            ).tolist()
+                            should_update = (
+                                can_fill_batch
+                                or (buffer_step_count >= max_buffer_steps)
+                                or is_last_step
+                            )
 
-                            with marked_timer("update_actor", timing_raw, color="red"):
-                                actor_output = self.actor_rollout_wg.update_actor(train_batch)
+                            if not should_update:
+                                # Skip: no gradient update this step
+                                metrics["buffer/action"] = 0
+                                print(f"[INFO] step {self.global_steps}: SKIP update. "
+                                      f"pos={pos_count}, neg={neg_count}, "
+                                      f"min_required={min_required}, max_allowed={max_allowed}, "
+                                      f"buffer_steps={buffer_step_count}", flush=True)
+                            else:
+                                # Update: merge buffer, extract balanced batch, update actor
+                                metrics["buffer/action"] = 1
+                                force_reason = ""
+                                if not can_fill_batch:
+                                    force_reason = f" (FORCED: buffer_steps={buffer_step_count}>={max_buffer_steps} or last_step={is_last_step})"
+                                print(f"[INFO] step {self.global_steps}: UPDATE. "
+                                      f"pos={pos_count}, neg={neg_count}, "
+                                      f"min_required={min_required}, max_allowed={max_allowed}, "
+                                      f"buffer_steps={buffer_step_count}{force_reason}", flush=True)
 
-                            actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                            response_token_num = torch.sum(train_batch.batch["response_mask"]).item()
+                                # Merge buffer
+                                merged_buffer = DataProto.concat(ratio_buffer)
 
-                            div_key = [
-                                "actor-clip/pg_is_pos_ge_high_tokens_sum",
-                                "actor-clip/pg_is_pos_le_low_tokens_sum",
-                                "actor-clip/pg_is_neg_ge_high_tokens_sum",
-                                "actor-clip/pg_is_neg_le_low_tokens_sum",
-                                "actor-clip/pg_clip_pos_high_tokens_sum",
-                                "actor-clip/pg_clip_pos_low_tokens_sum",
-                                "actor-clip/pg_clip_neg_high_tokens_sum",
-                                "actor-clip/pg_clip_neg_low_tokens_sum",
-                            ]
-                            div_key.extend([f"actor-clip/pg_is_clip_sum_batch_{i}" for i in range(10)])
-                            for key in div_key:
-                                if key in actor_output_metrics:
-                                    actor_output_metrics[key] = actor_output_metrics[key] / response_token_num
-                            actor_output_metrics['actor/response_token_num'] = response_token_num
-                            metrics.update(actor_output_metrics)
+                                # Extract balanced batch (target = train_batch_size * rollout_n)
+                                target_batch_size = self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n
+                                train_batch, balance_info = self._extract_balanced_batch(merged_buffer, target_batch_size)
+                                metrics.update(balance_info)
 
-                            self._maybe_log_rollout_generations(train_batch, key="rollout")
+                                # Post-process
+                                post_process = self.config.trainer.get("post_process", None)
+                                if post_process and len(post_process) > 0:
+                                    print(f"[INFO] use post_process here, method: {post_process}", flush=True)
+                                    train_batch, post_metrics = self.post_process(train_batch, post_process, entropy=None)
+                                    metrics.update(post_metrics)
 
-                            # Clear buffer
-                            ratio_buffer = []
-                            buffer_step_count = 0
-                            del merged_buffer, train_batch
+                                # DP rank balancing on the final train_batch
+                                if self.config.trainer.balance_batch:
+                                    balance_method = self.config.trainer.get("balance_method", None)
+                                    if balance_method == "couple":
+                                        self._balance_batch_couple(train_batch, metrics=metrics)
+                                    elif balance_method == "balance":
+                                        self._balance_batch_balance(train_batch, metrics=metrics)
+                                    elif balance_method == "random":
+                                        self._balance_batch_random(train_batch, metrics=metrics)
+                                    else:
+                                        self._balance_batch(train_batch, metrics=metrics)
+
+                                train_batch.meta_info["global_token_num"] = torch.sum(
+                                    train_batch.batch["attention_mask"], dim=-1
+                                ).tolist()
+
+                                with marked_timer("update_actor", timing_raw, color="red"):
+                                    actor_output = self.actor_rollout_wg.update_actor(train_batch)
+
+                                actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                                response_token_num = torch.sum(train_batch.batch["response_mask"]).item()
+
+                                div_key = [
+                                    "actor-clip/pg_is_pos_ge_high_tokens_sum",
+                                    "actor-clip/pg_is_pos_le_low_tokens_sum",
+                                    "actor-clip/pg_is_neg_ge_high_tokens_sum",
+                                    "actor-clip/pg_is_neg_le_low_tokens_sum",
+                                    "actor-clip/pg_clip_pos_high_tokens_sum",
+                                    "actor-clip/pg_clip_pos_low_tokens_sum",
+                                    "actor-clip/pg_clip_neg_high_tokens_sum",
+                                    "actor-clip/pg_clip_neg_low_tokens_sum",
+                                ]
+                                div_key.extend([f"actor-clip/pg_is_clip_sum_batch_{i}" for i in range(10)])
+                                for key in div_key:
+                                    if key in actor_output_metrics:
+                                        actor_output_metrics[key] = actor_output_metrics[key] / response_token_num
+                                actor_output_metrics['actor/response_token_num'] = response_token_num
+                                metrics.update(actor_output_metrics)
+
+                                self._maybe_log_rollout_generations(train_batch, key="rollout")
+
+                                # Clear buffer
+                                ratio_buffer = []
+                                buffer_step_count = 0
+                                del merged_buffer, train_batch
 
                 # validate
                 if (

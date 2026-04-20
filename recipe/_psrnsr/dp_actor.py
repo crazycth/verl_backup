@@ -574,9 +574,37 @@ class DataParallelPPOActor(BasePPOActor):
 
         print(f"[INFO][update_policy][dp_actor] get batch size: {len(data)}", flush=True)
 
+        # ---- runtime override of ppo_mini_batch_size ----
+        # When the trainer dynamically resizes its global update batch (e.g.
+        # `dynamic_buffer_low/high` mode in ray_trainer.py), the config-time
+        # ppo_mini_batch_size is no longer correct: a different number of
+        # samples per DP rank means a different per-DP mini-batch size, and
+        # the loss scaling factor below also depends on it.
+        #
+        # The trainer passes `runtime_ppo_mini_batch_size_per_dp` through the
+        # batch's meta_info; we honor it for both the data.split() call and
+        # the loss_scale_factor computation. If absent, behavior is unchanged.
+        runtime_mini = data.meta_info.get("runtime_ppo_mini_batch_size_per_dp", None)
+        if runtime_mini is not None:
+            runtime_mini = int(runtime_mini)
+            assert runtime_mini > 0, f"runtime_ppo_mini_batch_size_per_dp must be > 0, got {runtime_mini}"
+            assert len(data) % runtime_mini == 0, (
+                f"runtime_ppo_mini_batch_size_per_dp ({runtime_mini}) does not "
+                f"divide per-DP batch size ({len(data)})"
+            )
+            effective_ppo_mini = runtime_mini
+            print(
+                f"[INFO][update_policy][dp_actor] runtime override: "
+                f"ppo_mini_batch_size_per_dp={effective_ppo_mini} "
+                f"(config value was {self.config.ppo_mini_batch_size})",
+                flush=True,
+            )
+        else:
+            effective_ppo_mini = self.config.ppo_mini_batch_size
+
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
-        mini_batches = data.split(self.config.ppo_mini_batch_size)
+        mini_batches = data.split(effective_ppo_mini)
 
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
 
@@ -621,7 +649,7 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
                 else:
                     self.gradient_accumulation = (
-                        self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
+                        effective_ppo_mini // self.config.ppo_micro_batch_size_per_gpu
                     )
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
@@ -653,7 +681,7 @@ class DataParallelPPOActor(BasePPOActor):
                         micro_valid_tokens = response_mask.sum().item()
                         loss_scale_factor = micro_valid_tokens / mini_batch_total_tokens
                     elif self.config.use_dynamic_bsz:
-                        loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
+                        loss_scale_factor = response_mask.shape[0] / effective_ppo_mini
                     else:
                         loss_scale_factor = 1 / self.gradient_accumulation
 
