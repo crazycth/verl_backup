@@ -641,6 +641,30 @@ class DataParallelPPOActor(BasePPOActor):
             precise_token_mean = False
         print(f"[INFO] precise_token_mean: {precise_token_mean}", flush=True)
 
+        # Global (across-DP) token-mean: fixes the per-rank token-mean bias introduced
+        # by FSDP's (1/W) grad averaging combined with per-rank `/N_i` normalization
+        # (which makes ranks with fewer tokens dominate the update). When enabled, we
+        # all-reduce response_mask.sum() across the DP group and scale each
+        # micro_batch's loss by `micro_tokens / global_tokens * world_size`, so the
+        # accumulated gradient equals the exact global token-mean:
+        #     g = (1 / N_global) * sum_{all t} grad(loss_t)
+        # Supersedes precise_token_mean (which is only correct within a single rank).
+        global_token_mean = self.config.get("global_token_mean", False)
+        if global_token_mean and self.config.loss_agg_mode != "token-mean":
+            print(f"[WARN][dp_actor] global_token_mean is only effective with loss_agg_mode='token-mean', "
+                  f"but got '{self.config.loss_agg_mode}'. Falling back to default scaling.", flush=True)
+            global_token_mean = False
+        if global_token_mean and self.ulysses_sequence_parallel_size > 1:
+            # Not yet handled: with SP, response_mask is already replicated across SP ranks,
+            # so a naive DP all-reduce would over-count. Left for a later change.
+            raise NotImplementedError(
+                "global_token_mean with ulysses_sequence_parallel_size>1 is not yet supported. "
+                "Disable SP or extend the all-reduce to account for SP-replicated masks."
+            )
+        # Resolve DP world size (pure FSDP: default PG == DP group, size == world size).
+        dp_world_size = dist.get_world_size() if dist.is_initialized() else 1
+        print(f"[INFO] global_token_mean: {global_token_mean}, dp_world_size: {dp_world_size}", flush=True)
+
         metrics = {}
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
@@ -658,7 +682,28 @@ class DataParallelPPOActor(BasePPOActor):
                 # Pre-compute total valid tokens across the entire mini_batch for precise token-mean.
                 # This lets us weight each micro_batch's gradient by its actual token share,
                 # instead of the uniform 1/N that over-weights short-response micro_batches.
-                if precise_token_mean:
+                if global_token_mean:
+                    # All-reduce mini_batch token count across DP group, then multiply by
+                    # world_size to cancel FSDP's (1/W) grad averaging, yielding exact
+                    # global token-mean regardless of per-rank token imbalance.
+                    local_tokens = mini_batch.batch["response_mask"].sum().to(get_device_id()).float()
+                    global_tokens = local_tokens.clone()
+                    dist.all_reduce(global_tokens, op=dist.ReduceOp.SUM)
+                    mini_batch_total_tokens = max(global_tokens.item(), 1.0)
+                    # Diagnostic: how imbalanced are token counts across DP ranks?
+                    gathered = [torch.zeros_like(local_tokens) for _ in range(dp_world_size)]
+                    dist.all_gather(gathered, local_tokens)
+                    local_counts = torch.stack(gathered)
+                    gtm_max = local_counts.max().item()
+                    gtm_min = local_counts.min().item()
+                    gtm_mean = local_counts.mean().item()
+                    print(
+                        f"[INFO][dp_actor] global_token_mean: N_global={mini_batch_total_tokens:.0f}, "
+                        f"per-rank min/mean/max = {gtm_min:.0f}/{gtm_mean:.0f}/{gtm_max:.0f}, "
+                        f"imbalance ratio (max/min) = {(gtm_max / max(gtm_min, 1.0)):.2f}",
+                        flush=True,
+                    )
+                elif precise_token_mean:
                     mini_batch_total_tokens = max(mini_batch.batch["response_mask"].sum().item(), 1.0)
 
                 print(f"[INFO][dp_actor] diff prompt size in minibatch: {len(set(mini_batch.non_tensor_batch['uid']))}", flush=True)
@@ -674,7 +719,16 @@ class DataParallelPPOActor(BasePPOActor):
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
 
-                    if precise_token_mean:
+                    if global_token_mean:
+                        # Global token-mean: loss_scale = micro_tokens / N_global * W.
+                        # After FSDP's (1/W) grad averaging, effective update =
+                        # (1 / N_global) * sum_{all t} grad(loss_t) across all DP ranks.
+                        # Note: pg_loss inside is already `.sum() / mask.sum()` (per-micro
+                        # token-mean) -- the `micro_valid_tokens` factor here cancels that
+                        # denominator, turning it back into a raw sum before global scaling.
+                        micro_valid_tokens = response_mask.sum().item()
+                        loss_scale_factor = micro_valid_tokens / mini_batch_total_tokens * dp_world_size
+                    elif precise_token_mean:
                         # Precise token-mean: each micro_batch contributes proportional to its
                         # valid token count. token_mean_i * (T_i / T_total) = token_sum_i / T_total,
                         # so the accumulated gradient equals the exact global token-mean.
