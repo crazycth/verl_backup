@@ -1079,6 +1079,49 @@ class RayPPOTrainer:
         batch.reorder(reorder_idx)
         metrics[f"{logging_prefix}/applied"] = True
 
+    def _balance_batch_posneg(self, batch: DataProto, metrics, logging_prefix="posneg"):
+        """Reorder so that within each DP rank's chunk, positives come first, negatives after.
+
+        This ensures that when each rank splits its chunk into sequential mini-batches,
+        the earlier mini-batches contain positive samples and the later ones contain negatives.
+        """
+        scores = np.array(batch.non_tensor_batch['score'])
+        batch_size = len(batch)
+        world_size = self.actor_rollout_wg.world_size
+
+        if batch_size < world_size:
+            return
+
+        chunk_size = batch_size // world_size
+        reorder_idx = []
+
+        total_pos = 0
+        total_neg = 0
+        for rank in range(world_size):
+            start = rank * chunk_size
+            end = start + chunk_size
+            chunk_indices = np.arange(start, end)
+            chunk_scores = scores[start:end]
+
+            pos_mask = chunk_scores > 0
+            pos_indices = chunk_indices[pos_mask]
+            neg_indices = chunk_indices[~pos_mask]
+
+            total_pos += len(pos_indices)
+            total_neg += len(neg_indices)
+
+            reorder_idx.extend(pos_indices.tolist())
+            reorder_idx.extend(neg_indices.tolist())
+
+        # handle remainder (if batch_size not perfectly divisible)
+        remainder_start = world_size * chunk_size
+        if remainder_start < batch_size:
+            reorder_idx.extend(range(remainder_start, batch_size))
+
+        batch.reorder(torch.tensor(reorder_idx, device=batch.batch.device))
+        metrics[f"{logging_prefix}/total_pos"] = total_pos
+        metrics[f"{logging_prefix}/total_neg"] = total_neg
+
     def compute_rollout_importance_weights_and_add_to_batch(self, batch: DataProto) -> tuple[DataProto, dict]:
         """Compute rollout importance sampling weights and mismatch metrics, conditionally add weights to batch.
 
@@ -1860,6 +1903,8 @@ class RayPPOTrainer:
                             self._balance_batch_balance(batch, metrics=metrics)
                         elif balance_method == "random":
                             self._balance_batch_random(batch, metrics=metrics)
+                        elif balance_method == "posneg":
+                            self._balance_batch_posneg(batch, metrics=metrics)
                         else:
                             self._balance_batch(batch, metrics=metrics)
 
@@ -2121,6 +2166,8 @@ class RayPPOTrainer:
                                         self._balance_batch_balance(train_batch, metrics=metrics)
                                     elif balance_method == "random":
                                         self._balance_batch_random(train_batch, metrics=metrics)
+                                    elif balance_method == "posneg":
+                                        self._balance_batch_posneg(train_batch, metrics=metrics)
                                     else:
                                         self._balance_batch(train_batch, metrics=metrics)
 
@@ -2245,6 +2292,8 @@ class RayPPOTrainer:
                                         self._balance_batch_balance(train_batch, metrics=metrics)
                                     elif balance_method == "random":
                                         self._balance_batch_random(train_batch, metrics=metrics)
+                                    elif balance_method == "posneg":
+                                        self._balance_batch_posneg(train_batch, metrics=metrics)
                                     else:
                                         self._balance_batch(train_batch, metrics=metrics)
 

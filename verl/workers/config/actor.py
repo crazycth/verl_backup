@@ -149,6 +149,9 @@ class ActorConfig(BaseConfig):
     # precise token mean
     precise_token_mean: bool = False
 
+    # global (across-DP) token mean: fixes the per-rank token-mean bias under FSDP.
+    global_token_mean: bool = False
+
     def __post_init__(self):
         """Validate actor configuration parameters."""
         assert self.strategy != MISSING
